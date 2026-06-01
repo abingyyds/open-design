@@ -826,6 +826,9 @@ function OnboardingView({
     | { status: 'running'; inputKey: string }
     | { status: 'done'; inputKey: string; result: ProviderModelsResponse }
   >({ status: 'idle' });
+  const [amrCloudVisible, setAmrCloudVisible] = useState(
+    () => agents.length === 0 || agents.some((agent) => agent.id === 'amr' && agent.available),
+  );
   const [localProviderModelsCache, setLocalProviderModelsCache] = useState<
     Record<string, ProviderModelOption[]>
   >({});
@@ -896,7 +899,7 @@ function OnboardingView({
     (agent) => agent.available && agent.id !== 'amr' && visibleAgentIds.includes(agent.id),
   );
   const amrAgent = agents.find((agent) => agent.id === 'amr' && agent.available) ?? null;
-  const showAmrCloudOption = amrAgent !== null || agents.length === 0;
+  const showAmrCloudOption = amrCloudVisible;
   const amrSignedIn = amrStatus?.loggedIn === true;
   const amrSelectedAndSignedOut = runtime === 'amr' && !amrSignedIn;
   const amrAgentChoice = config.agentModels?.amr ?? {};
@@ -927,6 +930,11 @@ function OnboardingView({
       agentRevealTimersRef.current = [];
     };
   }, []);
+
+  useEffect(() => {
+    if (amrCloudVisible) return;
+    if (amrAgent || agents.length === 0) setAmrCloudVisible(true);
+  }, [agents.length, amrAgent, amrCloudVisible]);
 
   useEffect(() => {
     if (!amrAgent || runtime !== null) return;
