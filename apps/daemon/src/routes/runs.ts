@@ -295,6 +295,7 @@ export interface RegisterRunRoutesDeps {
       run: ChatRun,
     ) => void;
   };
+  platform?: any;
 }
 
 type TerminalRunStatus = RunStatusForAnalytics & {
@@ -451,6 +452,41 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     pinAssistantMessageOnRunCreate,
     reconcileAssistantMessageOnRunEnd,
   } = ctx.messages;
+  const platform = ctx.platform;
+
+  function platformUser(req: Request): any | null {
+    return platform?.enabled ? platform.currentUser?.(req) ?? null : null;
+  }
+
+  function preparePlatformRunBody(req: Request, body: JsonRecord): JsonRecord {
+    if (!platform?.enabled) return body;
+    const user = platformUser(req);
+    if (!user) throw new Error('PLATFORM_LOGIN_REQUIRED');
+    const runtime = platform.runtimeForUser(user.id);
+    return {
+      ...body,
+      agentId: 'codex',
+      model: runtime.model || (typeof body.model === 'string' ? body.model : null),
+      platformUserId: user.id,
+    };
+  }
+
+  function projectVisibleForRequest(req: Request, project: ProjectRecord | null): boolean {
+    if (!platform?.enabled) return true;
+    return platform.projectBelongsToRequest?.(req, project) === true;
+  }
+
+  function runVisibleForRequest(req: Request, run: ChatRun | null): boolean {
+    if (!platform?.enabled) return true;
+    if (!run) return false;
+    const user = platformUser(req);
+    if (!user) return false;
+    if ((run as any).platformUserId) return (run as any).platformUserId === user.id;
+    if (run.projectId) {
+      return projectVisibleForRequest(req, toProjectRecord(getProject(db, run.projectId)));
+    }
+    return false;
+  }
 
   function runToolBundleDeliveryTargetForProject(
     projectId: unknown,
@@ -473,7 +509,12 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     if (ctx.lifecycle.isDaemonShuttingDown()) {
       return sendApiError(res, 503, 'UPSTREAM_UNAVAILABLE', 'daemon is shutting down');
     }
-    const requestBody = toJsonRecord(req.body);
+    let requestBody = toJsonRecord(req.body);
+    try {
+      requestBody = preparePlatformRunBody(req, requestBody);
+    } catch (err) {
+      return sendApiError(res, 401, 'PLATFORM_LOGIN_REQUIRED', '请先登录平台账号');
+    }
     const mediaExecution = parseMediaExecutionPolicyInput(requestBody.mediaExecution);
     if (!mediaExecution.ok) {
       return sendApiError(res, 400, 'BAD_REQUEST', mediaExecution.message);
@@ -549,6 +590,9 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     if (typeof meta.projectId === 'string' && meta.projectId) {
       try {
         runProject = toProjectRecord(getProject(db, meta.projectId));
+        if (!projectVisibleForRequest(req, runProject)) {
+          return sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+        }
         assertSandboxProjectRootAvailable(runProject?.metadata);
       } catch (err) {
         if (err instanceof SandboxImportedProjectError) {
@@ -636,6 +680,9 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
       }
     }
     const run = design.runs.create(meta);
+    if (platform?.enabled && typeof (meta as any).platformUserId === 'string') {
+      (run as any).platformUserId = (meta as any).platformUserId;
+    }
     try {
       pinAssistantMessageOnRunCreate(db, run);
     } catch (err) {
@@ -1215,7 +1262,9 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
 
   app.get('/api/runs', (req: ApiRequest, res: ApiResponse) => {
     const { projectId, conversationId, status } = req.query;
-    const runs = design.runs.list({ projectId, conversationId, status });
+    const runs = design.runs
+      .list({ projectId, conversationId, status })
+      .filter((run) => runVisibleForRequest(req, run));
     const body = { runs: runs.map(design.runs.statusBody) };
     res.json(body);
   });
@@ -1225,8 +1274,12 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     if (!runId) return sendApiError(res, 400, 'BAD_REQUEST', 'run id missing');
     const run = design.runs.get(runId);
     if (!run) return sendApiError(res, 404, 'NOT_FOUND', 'run not found');
+    if (!runVisibleForRequest(req, run)) return sendApiError(res, 404, 'NOT_FOUND', 'run not found');
     const status = design.runs.statusBody(run);
     const project = run.projectId ? toProjectRecord(getProject(db, run.projectId)) : null;
+    if (project && !projectVisibleForRequest(req, project)) {
+      return sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+    }
     let files: ProjectFileEntry[] = [];
     if (project) {
       const packageMetadata = run.projectMetadata ?? null;
@@ -1311,6 +1364,7 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     if (!runId) return sendApiError(res, 400, 'BAD_REQUEST', 'run id missing');
     const run = design.runs.get(runId);
     if (!run) return sendApiError(res, 404, 'NOT_FOUND', 'run not found');
+    if (!runVisibleForRequest(req, run)) return sendApiError(res, 404, 'NOT_FOUND', 'run not found');
     res.json(design.runs.statusBody(run));
   });
 
@@ -1319,6 +1373,7 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     if (!runId) return sendApiError(res, 400, 'BAD_REQUEST', 'run id missing');
     const run = design.runs.get(runId);
     if (!run) return sendApiError(res, 404, 'NOT_FOUND', 'run not found');
+    if (!runVisibleForRequest(req, run)) return sendApiError(res, 404, 'NOT_FOUND', 'run not found');
     design.runs.stream(run, req, res);
   });
 
@@ -1327,6 +1382,7 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     if (!runId) return sendApiError(res, 400, 'BAD_REQUEST', 'run id missing');
     const run = design.runs.get(runId);
     if (!run) return sendApiError(res, 404, 'NOT_FOUND', 'run not found');
+    if (!runVisibleForRequest(req, run)) return sendApiError(res, 404, 'NOT_FOUND', 'run not found');
     const { encodeOdEventForAgui } = await import('@open-design/agui-adapter');
     const sse = createSseResponse(res);
     const lastEventId = Number(req.get('Last-Event-ID') || req.query.after || 0);
@@ -1376,6 +1432,7 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     if (!runId) return sendApiError(res, 400, 'BAD_REQUEST', 'run id missing');
     const run = design.runs.get(runId);
     if (!run) return sendApiError(res, 404, 'NOT_FOUND', 'run not found');
+    if (!runVisibleForRequest(req, run)) return sendApiError(res, 404, 'NOT_FOUND', 'run not found');
     const status = await design.runs.cancel(run);
     const body = { ok: true, run: status };
     res.json(body);
@@ -1385,7 +1442,12 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     if (ctx.lifecycle.isDaemonShuttingDown()) {
       return sendApiError(res, 503, 'UPSTREAM_UNAVAILABLE', 'daemon is shutting down');
     }
-    const requestBody = toJsonRecord(req.body);
+    let requestBody = toJsonRecord(req.body);
+    try {
+      requestBody = preparePlatformRunBody(req, requestBody);
+    } catch (err) {
+      return sendApiError(res, 401, 'PLATFORM_LOGIN_REQUIRED', '请先登录平台账号');
+    }
     const mediaExecution = parseMediaExecutionPolicyInput(requestBody.mediaExecution);
     if (!mediaExecution.ok) {
       return sendApiError(res, 400, 'BAD_REQUEST', mediaExecution.message);
@@ -1398,6 +1460,9 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     if (typeof requestBody.projectId === 'string' && requestBody.projectId) {
       try {
         chatProject = toProjectRecord(getProject(db, requestBody.projectId));
+        if (!projectVisibleForRequest(req, chatProject)) {
+          return sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+        }
         assertSandboxProjectRootAvailable(chatProject?.metadata);
       } catch (err) {
         if (err instanceof SandboxImportedProjectError) {
@@ -1426,6 +1491,9 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
       ...(chatProject?.metadata ? { projectMetadata: chatProject.metadata } : {}),
     };
     const run = design.runs.create(meta);
+    if (platform?.enabled && typeof (meta as any).platformUserId === 'string') {
+      (run as any).platformUserId = (meta as any).platformUserId;
+    }
     design.runs.stream(run, req, res);
     design.runs.start(run, () => startChatRun(meta, run));
   });

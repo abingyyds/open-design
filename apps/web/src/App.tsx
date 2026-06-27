@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { flushSync } from 'react-dom';
 import { AnimatePresence, motion, MotionConfig } from 'motion/react';
 import { useAnalytics } from './analytics/provider';
@@ -63,6 +63,15 @@ import {
   listProjectRuns,
   type VelaLoginStatus,
 } from './providers/daemon';
+import {
+  fetchPlatformModels,
+  fetchPlatformStatus,
+  loginPlatform,
+  logoutPlatform,
+  setPlatformModel,
+  type PlatformModel,
+  type PlatformUser,
+} from './providers/platform';
 import { AMR_LOGIN_STATUS_EVENT } from './components/amrLoginPolling';
 import { navigate, useRoute } from './router';
 import {
@@ -120,8 +129,31 @@ import type {
 
 const APP_CONFIG_CHANGED_EVENT = 'open-design:app-config-changed';
 const AMR_AGENT_ID = 'amr';
+const PLATFORM_AGENT_ID = 'codex';
 const AMR_PROFILE_ENV_KEY = 'OPEN_DESIGN_AMR_PROFILE';
 const AGENT_FOCUS_REFRESH_THROTTLE_MS = 10_000;
+
+type PlatformUiState = {
+  loaded: boolean;
+  enabled: boolean;
+  authenticated: boolean;
+  user: PlatformUser | null;
+  models: PlatformModel[];
+  defaultModel: string;
+  error: string | null;
+  savingModel: boolean;
+};
+
+const emptyPlatformState: PlatformUiState = {
+  loaded: false,
+  enabled: false,
+  authenticated: false,
+  user: null,
+  models: [],
+  defaultModel: '',
+  error: null,
+  savingModel: false,
+};
 
 export function shouldSyncMediaProvidersOnSave(
   mediaProviders: AppConfig['mediaProviders'],
@@ -369,6 +401,11 @@ function AppInner() {
   const [settingsHighlight, setSettingsHighlight] = useState<SettingsHighlight>(null);
   const [integrationInitialTab, setIntegrationInitialTab] = useState<IntegrationTab>('mcp');
   const [daemonLive, setDaemonLive] = useState(false);
+  const [platformState, setPlatformState] = useState<PlatformUiState>(emptyPlatformState);
+  const platformStateRef = useRef(platformState);
+  platformStateRef.current = platformState;
+  const platformReadyForApp =
+    platformState.loaded && (!platformState.enabled || platformState.authenticated);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const amrModelsRef = useRef<AmrModelsResponse | null>(null);
   const amrPollGenerationRef = useRef(0);
@@ -481,6 +518,81 @@ function AppInner() {
       );
     }
   }, []);
+
+  const applyPlatformRuntimeConfig = useCallback((model?: string) => {
+    setConfig((prev) => {
+      const previousChoice = prev.agentModels?.[PLATFORM_AGENT_ID] ?? {};
+      const next: AppConfig = {
+        ...prev,
+        mode: 'daemon',
+        agentId: PLATFORM_AGENT_ID,
+        onboardingCompleted: true,
+        agentModels: {
+          ...(prev.agentModels ?? {}),
+          [PLATFORM_AGENT_ID]: {
+            ...previousChoice,
+            ...(model ? { model } : {}),
+          },
+        },
+      };
+      latestPersistedConfigRef.current = next;
+      saveConfig(next);
+      void syncConfigToDaemon(next);
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const status = await fetchPlatformStatus();
+        if (cancelled) return;
+        if (!status.enabled) {
+          setPlatformState({
+            ...emptyPlatformState,
+            loaded: true,
+            enabled: false,
+          });
+          return;
+        }
+        if (!status.authenticated || !status.user) {
+          setPlatformState({
+            ...emptyPlatformState,
+            loaded: true,
+            enabled: true,
+          });
+          return;
+        }
+        const modelsResult = await fetchPlatformModels();
+        if (cancelled) return;
+        const defaultModel =
+          modelsResult.defaultModel || modelsResult.models[0]?.id || '';
+        setPlatformState({
+          loaded: true,
+          enabled: true,
+          authenticated: true,
+          user: status.user,
+          models: modelsResult.models,
+          defaultModel,
+          error: null,
+          savingModel: false,
+        });
+        applyPlatformRuntimeConfig(defaultModel);
+      } catch (err) {
+        if (cancelled) return;
+        setPlatformState({
+          ...emptyPlatformState,
+          loaded: true,
+          enabled: true,
+          error: err instanceof Error ? err.message : '平台状态读取失败',
+        });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [applyPlatformRuntimeConfig]);
 
   const beginProjectListRequest = useCallback((): ProjectListRequest => {
     projectListRequestGenerationRef.current += 1;
@@ -663,6 +775,7 @@ function AppInner() {
     config.privacyDecisionAt == null &&
     config.onboardingCompleted === true;
   useEffect(() => {
+    if (!platformReadyForApp) return;
     const body = activeProjectId
       ? { projectId: activeProjectId, fileName: activeFileName }
       : { active: false };
@@ -673,10 +786,10 @@ function AppInner() {
     }).catch(() => {
       // Daemon down or transient network — not worth surfacing.
     });
-  }, [activeProjectId, activeFileName]);
+  }, [activeProjectId, activeFileName, platformReadyForApp]);
 
   useEffect(() => {
-    if (!daemonLive) return;
+    if (!daemonLive || !platformReadyForApp) return;
     let cancelled = false;
     let timer: number | null = null;
     const pollGeneration = amrPollGenerationRef.current + 1;
@@ -715,7 +828,7 @@ function AppInner() {
       cancelled = true;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [amrPollRestartToken, daemonLive]);
+  }, [amrPollRestartToken, daemonLive, platformReadyForApp]);
 
   // App-level AMR sign-in state. Feeds two analytics globals: the
   // `amr` configure_type bucket (deriveConfigureGlobals below) and the
@@ -725,6 +838,7 @@ function AppInner() {
   // AMR_LOGIN_STATUS_EVENT covers logins finishing in surfaces that
   // unmounted before their poll settled.
   useEffect(() => {
+    if (!platformReadyForApp) return;
     let cancelled = false;
     const sync = async () => {
       const status = await fetchVelaLoginStatus();
@@ -739,7 +853,7 @@ function AppInner() {
       cancelled = true;
       window.removeEventListener(AMR_LOGIN_STATUS_EVENT, onStatusEvent);
     };
-  }, [daemonLive]);
+  }, [daemonLive, platformReadyForApp]);
 
   useEffect(() => {
     analytics.setUserId(
@@ -759,6 +873,7 @@ function AppInner() {
   // which made the slowest endpoint (typically `/api/agents` on cold start)
   // gate every tab including the ones that don't need agents at all.
   useEffect(() => {
+    if (!platformReadyForApp) return;
     let cancelled = false;
     const agentStreamAbort = new AbortController();
     (async () => {
@@ -914,6 +1029,21 @@ function AppInner() {
           ),
           daemonMediaProvidersLoaded,
         );
+        const platformSnapshot = platformStateRef.current;
+        if (platformSnapshot.enabled) {
+          const model =
+            platformSnapshot.defaultModel || platformSnapshot.models[0]?.id || '';
+          next.mode = 'daemon';
+          next.agentId = PLATFORM_AGENT_ID;
+          next.onboardingCompleted = true;
+          next.agentModels = {
+            ...(next.agentModels ?? {}),
+            [PLATFORM_AGENT_ID]: {
+              ...(next.agentModels?.[PLATFORM_AGENT_ID] ?? {}),
+              ...(model ? { model } : {}),
+            },
+          };
+        }
         const hasLocalComposioKey = Boolean(next.composio?.apiKey?.trim());
         if (!hasLocalComposioKey && daemonComposioConfig) {
           next.composio = daemonComposioConfig;
@@ -962,6 +1092,7 @@ function AppInner() {
     beginAgentStreamRequest,
     beginProjectListRequest,
     isCurrentAgentStreamRequest,
+    platformReadyForApp,
     reconcileFetchedProjects,
   ]);
 
@@ -1298,8 +1429,72 @@ function AppInner() {
     [beginAgentStreamRequest, config, isCurrentAgentStreamRequest],
   );
 
+  const handlePlatformLogin = useCallback(
+    async (username: string, password: string) => {
+      setPlatformState((current) => ({ ...current, error: null }));
+      try {
+        const result = await loginPlatform(username, password);
+        const defaultModel = result.defaultModel || result.models[0]?.id || '';
+        setPlatformState({
+          loaded: true,
+          enabled: true,
+          authenticated: true,
+          user: result.user,
+          models: result.models,
+          defaultModel,
+          error: null,
+          savingModel: false,
+        });
+        applyPlatformRuntimeConfig(defaultModel);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : '登录失败';
+        setPlatformState((current) => ({ ...current, error: message }));
+        throw err;
+      }
+    },
+    [applyPlatformRuntimeConfig],
+  );
+
+  const handlePlatformLogout = useCallback(async () => {
+    await logoutPlatform();
+    setPlatformState({
+      ...emptyPlatformState,
+      loaded: true,
+      enabled: true,
+    });
+    setProjects([]);
+    setAgents([]);
+    setDaemonLive(false);
+    navigate({ kind: 'home', view: 'home' }, { replace: true });
+  }, []);
+
+  const handlePlatformModelChange = useCallback(
+    async (model: string) => {
+      if (!model || model === platformStateRef.current.defaultModel) return;
+      setPlatformState((current) => ({ ...current, savingModel: true, error: null }));
+      try {
+        const result = await setPlatformModel(model);
+        const nextModel = result.defaultModel || model;
+        setPlatformState((current) => ({
+          ...current,
+          defaultModel: nextModel,
+          savingModel: false,
+        }));
+        applyPlatformRuntimeConfig(nextModel);
+        void refreshAgents();
+      } catch (err) {
+        setPlatformState((current) => ({
+          ...current,
+          savingModel: false,
+          error: err instanceof Error ? err.message : '模型保存失败',
+        }));
+      }
+    },
+    [applyPlatformRuntimeConfig, refreshAgents],
+  );
+
   useEffect(() => {
-    if (!daemonLive || agentsLoading) return;
+    if (!daemonLive || agentsLoading || !platformReadyForApp) return;
 
     const refreshIfDue = () => {
       if (document.visibilityState === 'hidden') return;
@@ -1319,7 +1514,7 @@ function AppInner() {
       window.removeEventListener('focus', refreshIfDue);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [agentsLoading, daemonLive, refreshAgents]);
+  }, [agentsLoading, daemonLive, platformReadyForApp, refreshAgents]);
 
   useEffect(() => {
     const handleAppConfigChanged = () => {
@@ -2107,6 +2302,25 @@ function AppInner() {
     [designSystems, config.disabledDesignSystems],
   );
 
+  if (!platformState.loaded) {
+    return (
+      <PlatformStandaloneShell>
+        <CenteredLoader label="正在连接平台..." />
+      </PlatformStandaloneShell>
+    );
+  }
+
+  if (platformState.enabled && !platformState.authenticated) {
+    return (
+      <PlatformStandaloneShell>
+        <PlatformLoginPanel
+          error={platformState.error}
+          onLogin={handlePlatformLogin}
+        />
+      </PlatformStandaloneShell>
+    );
+  }
+
   // Phase 2B / spec §11.6 — marketplace deep UI dispatch. The
   // /marketplace and /marketplace/:id routes render outside the
   // EntryView / ProjectView split so the discovery surface stays
@@ -2265,7 +2479,7 @@ function AppInner() {
   return (
     <>
       <div
-        className={`workspace-shell workspace-shell--${clientType}`}
+        className={`workspace-shell workspace-shell--${clientType}${platformState.enabled ? ' workspace-shell--platform' : ''}`}
         data-client-type={clientType}
       >
         <WorkspaceTabsBar
@@ -2273,6 +2487,16 @@ function AppInner() {
           projects={projects}
           onboardingCompleted={config.onboardingCompleted === true}
         />
+        {platformState.enabled ? (
+          <PlatformAccountBar
+            user={platformState.user}
+            models={platformState.models}
+            selectedModel={platformState.defaultModel}
+            savingModel={platformState.savingModel}
+            onModelChange={handlePlatformModelChange}
+            onLogout={handlePlatformLogout}
+          />
+        ) : null}
         <div className="workspace-shell__body">
           {appMain}
         </div>
@@ -2384,6 +2608,148 @@ function AppInner() {
       ) : null}
       </AnimatePresence>
     </>
+  );
+}
+
+function PlatformStandaloneShell({ children }: { children: ReactNode }) {
+  return (
+    <main className="platform-standalone-shell">
+      {children}
+    </main>
+  );
+}
+
+function PlatformLoginPanel({
+  error,
+  onLogin,
+}: {
+  error: string | null;
+  onLogin: (username: string, password: string) => Promise<void>;
+}) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setLocalError(null);
+    if (!username.trim() || !password.trim()) {
+      setLocalError('请输入账号和密码');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await onLogin(username.trim(), password);
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : '登录失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <section className="platform-login-panel" aria-label="平台登录">
+      <div className="platform-login-panel__header">
+        <div className="platform-login-panel__mark" aria-hidden>OD</div>
+        <div>
+          <h1>Open Design</h1>
+          <p>使用你的账号登录后选择模型开始创作</p>
+        </div>
+      </div>
+      <form className="platform-login-form" onSubmit={submit}>
+        <label>
+          <span>账号</span>
+          <input
+            autoComplete="username"
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+            placeholder="用户名或邮箱"
+          />
+        </label>
+        <label>
+          <span>密码</span>
+          <input
+            autoComplete="current-password"
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            placeholder="请输入密码"
+          />
+        </label>
+        {localError || error ? (
+          <div className="platform-login-form__error" role="alert">
+            {localError ?? error}
+          </div>
+        ) : null}
+        <button className="platform-login-form__submit" type="submit" disabled={submitting}>
+          {submitting ? '登录中...' : '登录'}
+        </button>
+      </form>
+    </section>
+  );
+}
+
+function platformModelLabel(model: PlatformModel): string {
+  return model.label || model.name || model.id;
+}
+
+function platformAccountLabel(user: PlatformUser | null): string {
+  const account = user?.account;
+  const siteName = account?.siteName?.trim();
+  if (siteName) return siteName;
+  return 'SubRouter';
+}
+
+function PlatformAccountBar({
+  user,
+  models,
+  selectedModel,
+  savingModel,
+  onModelChange,
+  onLogout,
+}: {
+  user: PlatformUser | null;
+  models: PlatformModel[];
+  selectedModel: string;
+  savingModel: boolean;
+  onModelChange: (model: string) => void;
+  onLogout: () => void;
+}) {
+  return (
+    <div className="platform-account-bar">
+      <div className="platform-account-bar__identity">
+        <span className="platform-account-bar__site">{platformAccountLabel(user)}</span>
+        <span className="platform-account-bar__user">
+          {user?.displayName || user?.username || '已登录'}
+        </span>
+      </div>
+      <div className="platform-account-bar__controls">
+        <label className="platform-account-bar__model">
+          <span>模型</span>
+          <select
+            value={selectedModel}
+            disabled={savingModel || models.length === 0}
+            onChange={(event) => onModelChange(event.target.value)}
+          >
+            {models.length === 0 ? (
+              <option value="">暂无可用模型</option>
+            ) : models.map((model) => (
+              <option key={model.id} value={model.id}>
+                {platformModelLabel(model)}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          className="platform-account-bar__logout"
+          type="button"
+          onClick={onLogout}
+        >
+          退出
+        </button>
+      </div>
+    </div>
   );
 }
 

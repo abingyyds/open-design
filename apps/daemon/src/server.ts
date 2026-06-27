@@ -596,6 +596,11 @@ import {
 } from './library-tokens.js';
 import { listLibraryTokenOrigins } from './library-store.js';
 import { apiTokenFromEnv, isApiAuthDisabled, isApiTokenMiddlewareEnabled } from './api-token-auth.js';
+import {
+  SubrouterPlatform,
+  platformSessionMiddleware,
+  registerSubrouterPlatformRoutes,
+} from './platform/subrouter.js';
 import { createOpenDesignPublicMetadataService } from './services/open-design-public-metadata.js';
 
 /** @typedef {import('@open-design/contracts').ApiErrorCode} ApiErrorCode */
@@ -3343,6 +3348,7 @@ export async function startServer({
   let resolvedPort = port;
   let daemonShuttingDown = false;
   const extraAllowedOrigins = configuredAllowedOrigins();
+  const subrouterPlatform = new SubrouterPlatform(RUNTIME_DATA_DIR);
 
   // Plan §3.K1 / spec §15.7 — bound-API-token guard.
   //
@@ -3537,6 +3543,8 @@ export async function startServer({
     }
     next();
   });
+  registerSubrouterPlatformRoutes(app, subrouterPlatform);
+  app.use('/api', platformSessionMiddleware(subrouterPlatform));
   const db = openDatabase(PROJECT_ROOT, { dataDir: RUNTIME_DATA_DIR });
   // Restore paired browser-extension origins into the in-memory allowlist the
   // /api origin middleware above consults, so a paired clipper survives daemon
@@ -4204,6 +4212,7 @@ export async function startServer({
     appConfig: appConfigDeps,
     agents: agentDeps,
     validation: validationDeps,
+    platform: subrouterPlatform,
   });
   registerTerminalRoutes(app, {
     db,
@@ -4232,6 +4241,7 @@ export async function startServer({
   registerStaticResourceRoutes(app, {
     http: httpDeps,
     paths: pathDeps,
+    platform: subrouterPlatform,
     resources: {
       listAllSkills,
       listAllDesignTemplates,
@@ -5816,6 +5826,22 @@ export async function startServer({
     } catch {
       configuredAgentEnv = {};
     }
+    let platformRuntime = null;
+    if (subrouterPlatform.enabled && typeof chatBody.platformUserId === 'string') {
+      try {
+        platformRuntime = subrouterPlatform.runtimeForUser(chatBody.platformUserId);
+        configuredAgentEnv = {
+          ...configuredAgentEnv,
+          ...platformRuntime.agentEnv,
+        };
+      } catch (err) {
+        return design.runs.fail(
+          run,
+          'PLATFORM_LOGIN_REQUIRED',
+          err && err.message ? err.message : '请先登录平台账号',
+        );
+      }
+    }
     const requestedLiveModelScope = def.id === 'amr'
       ? resolveAmrProfile({
           ...process.env,
@@ -5833,6 +5859,10 @@ export async function startServer({
       process.env,
       requestedLiveModelScope,
     );
+    if (platformRuntime?.model && def.id === 'codex') {
+      safeModel = platformRuntime.model;
+      run.model = platformRuntime.model;
+    }
     const safeReasoning =
       typeof reasoning === 'string' && Array.isArray(def.reasoningOptions)
         ? (def.reasoningOptions.find((r) => r.id === reasoning)?.id ?? null)
@@ -8841,6 +8871,7 @@ export async function startServer({
       pinAssistantMessageOnRunCreate,
       reconcileAssistantMessageOnRunEnd,
     },
+    platform: subrouterPlatform,
   });
 
   // Each routine fire resolves an agent, prepares project/conversation state,

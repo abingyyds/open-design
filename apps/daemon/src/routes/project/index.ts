@@ -1,6 +1,6 @@
 import { rm } from 'node:fs/promises';
 import path from 'node:path';
-import type { Express, Response } from 'express';
+import type { Express, Request, Response } from 'express';
 import {
   defaultScenarioPluginIdForProjectMetadata,
   type ChatSessionMode,
@@ -34,7 +34,9 @@ import { auditDesignSystemPackage } from '../../tools-connectors-cli.js';
 import { parseOrchestratorWorkspace } from '../../workspace-contract.js';
 import { registerProjectConversationRoutes } from './conversations.js';
 
-export interface RegisterProjectRoutesDeps extends RouteDeps<'db' | 'design' | 'http' | 'paths' | 'projectStore' | 'projectFiles' | 'conversations' | 'templates' | 'status' | 'events' | 'ids' | 'telemetry' | 'appConfig' | 'agents' | 'validation'> {}
+export interface RegisterProjectRoutesDeps extends RouteDeps<'db' | 'design' | 'http' | 'paths' | 'projectStore' | 'projectFiles' | 'conversations' | 'templates' | 'status' | 'events' | 'ids' | 'telemetry' | 'appConfig' | 'agents' | 'validation'> {
+  platform?: any;
+}
 
 function projectDetailResolvedDir(
   projectsRoot: string,
@@ -909,6 +911,7 @@ function normalizeChatSessionMode(value: unknown): ChatSessionMode {
 
 export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDeps) {
   const { db, design } = ctx;
+  const platform = ctx.platform;
   const { sendApiError, createSseResponse } = ctx.http;
   const { DESIGN_SYSTEMS_DIR, PROJECTS_DIR, SKILLS_DIR, BRANDS_DIR } = ctx.paths;
   const { readAppConfig, writeAppConfig } = ctx.appConfig;
@@ -1024,6 +1027,24 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
     return locations.some((location) => !location.builtIn && projectBelongsToLocation(project, location));
   }
 
+  function platformProjectVisible(req: Request, project: any): boolean {
+    if (!platform?.enabled) return true;
+    return platform.projectBelongsToRequest?.(req, project) === true;
+  }
+
+  function platformStampProjectMetadata(req: Request, metadata: unknown) {
+    if (!platform?.enabled) return metadata ?? null;
+    return platform.stampProjectMetadata?.(req, metadata) ?? metadata ?? null;
+  }
+
+  function templateVisibleForRequest(req: Request, template: any): boolean {
+    if (!platform?.enabled) return true;
+    const sourceProject = typeof template?.sourceProjectId === 'string'
+      ? getProject(db, template.sourceProjectId)
+      : null;
+    return platformProjectVisible(req, sourceProject);
+  }
+
   async function resolveCreateProjectLocationId(explicitProjectLocationId: unknown): Promise<string> {
     if (typeof explicitProjectLocationId === 'string' && explicitProjectLocationId.trim()) {
       return explicitProjectLocationId.trim();
@@ -1055,6 +1076,15 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
       .filter((project: any) => removed.some((location) => projectBelongsToLocation(project, location)))
       .map((project: any) => project.id);
   }
+
+  app.use('/api/projects/:id', (req, res, next) => {
+    if (!platform?.enabled) return next();
+    const project = getProject(db, req.params.id);
+    if (project && !platformProjectVisible(req, project)) {
+      return sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'not found');
+    }
+    return next();
+  });
 
   app.get('/api/project-locations', async (_req, res) => {
     try {
@@ -1159,7 +1189,7 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
     }
   });
 
-  app.get('/api/projects', async (_req, res) => {
+  app.get('/api/projects', async (req, res) => {
     try {
       const locations = await configuredProjectLocations();
       const latestRunStatuses = listLatestProjectRunStatuses(db);
@@ -1184,6 +1214,7 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
       const body = {
         projects: listProjects(db)
           .filter((project: any) => projectVisibleForLocations(project, locations))
+          .filter((project: any) => platformProjectVisible(req, project))
           .map((project: any) => ({
             ...project,
             status: brandAwareProjectStatus(
@@ -1325,7 +1356,7 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
         }
         externalProjectDir = await createLocationProjectDir(location, id);
       }
-      const projectMetadata =
+      const rawProjectMetadata =
         metadata && typeof metadata === 'object'
           ? {
               ...metadata,
@@ -1363,6 +1394,7 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
                   projectLocationId: selectedLocationId,
                 }
               : null;
+      const projectMetadata = platformStampProjectMetadata(req, rawProjectMetadata);
       const now = Date.now();
       let project;
       try {
@@ -1504,7 +1536,7 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
   app.get('/api/projects/:id', async (req, res) => {
     const project = getProject(db, req.params.id);
     const locations = await configuredProjectLocations();
-    if (!project || !projectVisibleForLocations(project, locations))
+    if (!project || !projectVisibleForLocations(project, locations) || !platformProjectVisible(req, project))
       return sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'not found');
     const resolvedDir = projectDetailResolvedDir(PROJECTS_DIR, project, resolveProjectDir);
     /** @type {import('@open-design/contracts').ProjectResponse} */
@@ -1764,13 +1796,13 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
   // starting point. Created via the project's Share menu (snapshots
   // every .html file in the project folder at the moment of save).
 
-  app.get('/api/templates', (_req, res) => {
-    res.json({ templates: listTemplates(db) });
+  app.get('/api/templates', (req, res) => {
+    res.json({ templates: listTemplates(db).filter((template: any) => templateVisibleForRequest(req, template)) });
   });
 
   app.get('/api/templates/:id', (req, res) => {
     const t = getTemplate(db, req.params.id);
-    if (!t) return res.status(404).json({ error: 'not found' });
+    if (!t || !templateVisibleForRequest(req, t)) return res.status(404).json({ error: 'not found' });
     res.json({ template: t });
   });
 
@@ -1787,7 +1819,7 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
         return res.status(400).json({ error: 'sourceProjectId required' });
       }
       const sourceProject = getProject(db, sourceProjectId);
-      if (!sourceProject) {
+      if (!sourceProject || !platformProjectVisible(req, sourceProject)) {
         return res.status(404).json({ error: 'source project not found' });
       }
       // Snapshot every HTML / sketch / text file in the source project.

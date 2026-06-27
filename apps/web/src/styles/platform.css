@@ -1,0 +1,217 @@
+.workspace-shell--platform {
+  grid-template-rows: 36px 46px minmax(0, 1fr);
+}
+
+.workspace-shell--platform .workspace-shell__body {
+  grid-row: 3;
+}
+
+.platform-standalone-shell {
+  min-height: 100vh;
+  width: 100vw;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--bg-app) 92%, white), var(--bg-app)),
+    var(--bg-app);
+  color: var(--text);
+}
+
+.platform-login-panel {
+  width: min(420px, 100%);
+  padding: 28px;
+  border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-panel) 96%, white);
+  box-shadow: var(--shadow-lg);
+}
+
+.platform-login-panel__header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 24px;
+}
+
+.platform-login-panel__mark {
+  width: 42px;
+  height: 42px;
+  border-radius: var(--radius-md);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  color: var(--accent-contrast, #fff);
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.platform-login-panel h1 {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.platform-login-panel p {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.platform-login-form {
+  display: grid;
+  gap: 14px;
+}
+
+.platform-login-form label {
+  display: grid;
+  gap: 7px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.platform-login-form input,
+.platform-account-bar select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  color: var(--text);
+  outline: none;
+}
+
+.platform-login-form input {
+  height: 40px;
+  padding: 0 12px;
+  font-size: 14px;
+}
+
+.platform-login-form input:focus,
+.platform-account-bar select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.platform-login-form__error {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger, #cf222e) 12%, transparent);
+  color: var(--danger, #cf222e);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.platform-login-form__submit,
+.platform-account-bar__logout {
+  border: 0;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.platform-login-form__submit {
+  height: 40px;
+  background: var(--accent);
+  color: var(--accent-contrast, #fff);
+}
+
+.platform-login-form__submit:disabled {
+  cursor: progress;
+  opacity: 0.72;
+}
+
+.platform-account-bar {
+  grid-row: 2;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 92%, var(--bg-subtle));
+}
+
+.platform-account-bar__identity {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+}
+
+.platform-account-bar__site {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.platform-account-bar__user {
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.platform-account-bar__controls {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.platform-account-bar__model {
+  min-width: 180px;
+  display: grid;
+  grid-template-columns: auto minmax(120px, 280px);
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.platform-account-bar select {
+  height: 30px;
+  padding: 0 28px 0 10px;
+  font-size: 12px;
+}
+
+.platform-account-bar__logout {
+  height: 30px;
+  padding: 0 12px;
+  background: color-mix(in srgb, var(--bg-muted) 84%, transparent);
+  color: var(--text-muted);
+}
+
+.platform-account-bar__logout:hover {
+  background: color-mix(in srgb, var(--bg-muted) 70%, var(--accent));
+  color: var(--text);
+}
+
+@media (max-width: 720px) {
+  .workspace-shell--platform {
+    grid-template-rows: 36px auto minmax(0, 1fr);
+  }
+
+  .platform-account-bar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px 10px;
+  }
+
+  .platform-account-bar__controls,
+  .platform-account-bar__model {
+    width: 100%;
+  }
+
+  .platform-account-bar__model {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+}

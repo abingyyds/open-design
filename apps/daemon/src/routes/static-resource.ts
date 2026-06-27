@@ -3,7 +3,7 @@ import type Database from 'better-sqlite3';
 import path from 'node:path';
 import fs from 'node:fs';
 import type { DesignSystemTokenContractRebuildJobResponse } from '@open-design/contracts';
-import { detectAgents, detectAgentsStream } from '../agents.js';
+import { detectAgents, detectAgentsStream, getAgentDef } from '../agents.js';
 import {
   SkillImportError,
   deleteUserSkill,
@@ -35,6 +35,7 @@ export interface RegisterAtomRoutesDeps {
 }
 
 export interface RegisterStaticResourceRoutesDeps extends RouteDeps<'http' | 'paths' | 'resources'> {
+  platform?: any;
   tokenContractRebuild?: {
     maybeStartForImportedDesignSystem?: (
       designSystemId: string,
@@ -90,6 +91,7 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
     mimeFor,
   } = ctx.resources;
   const { isLocalSameOrigin, resolvedPortRef, sendApiError } = ctx.http;
+  const platform = ctx.platform;
   const requireLocalOrigin = (req: any, res: any) => {
     if (isLocalSameOrigin(req, resolvedPortRef.current)) return true;
     sendApiError(res, 403, 'FORBIDDEN', 'local origin required');
@@ -108,9 +110,70 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
     };
   };
 
+  async function platformCodexAgent(req: any) {
+    if (!platform?.enabled) return null;
+    const user = platform.currentUser?.(req);
+    if (!user) return null;
+    const def: any = getAgentDef('codex');
+    if (!def) return null;
+    const {
+      buildArgs,
+      listModels,
+      fetchModels,
+      fallbackModels,
+      helpArgs,
+      capabilityFlags,
+      fallbackBins,
+      versionProbeTimeoutMs,
+      maxPromptArgBytes,
+      env,
+      inactivityTimeoutMs,
+      authProbe,
+      ...rest
+    } = def;
+    let models = [];
+    try {
+      const runtime = platform.runtimeForUser(user.id);
+      const result = await platform.fetchModels(user.id);
+      models = Array.isArray(result.models)
+        ? result.models.map((model: any) => ({ id: model.id, label: model.label ?? model.id })).filter((model: any) => model.id)
+        : [];
+      if (models.length === 0 && runtime.model) {
+        models = [{ id: runtime.model, label: runtime.model }];
+      }
+    } catch {
+      models = [];
+    }
+    return {
+      ...rest,
+      models: models.length > 0 ? models : (fallbackModels ?? [{ id: 'default', label: 'Default' }]),
+      modelsSource: 'live',
+      available: true,
+      path: 'codex',
+      authStatus: 'authenticated',
+    };
+  }
+
   app.get('/api/agents', async (req, res) => {
     const wantsStream =
       req.query.stream === '1' || req.query.stream === 'true';
+    const platformAgent = await platformCodexAgent(req);
+    if (platformAgent) {
+      if (!wantsStream) {
+        res.json({ agents: [platformAgent] });
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      res.write(`event: agent\ndata: ${JSON.stringify(platformAgent)}\n\n`);
+      res.write('event: done\ndata: {}\n\n');
+      res.end();
+      return;
+    }
     let config;
     try {
       config = await readAppConfig(RUNTIME_DATA_DIR);

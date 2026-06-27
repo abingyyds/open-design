@@ -8,6 +8,7 @@
 @import './styles/social-share.css';
 @import './styles/workspace/terminal.css';
 @import './styles/shell.css';
+@import './styles/platform.css';
 @import './styles/chat.css';
 @import './styles/workspace/mention-home.css';
 @import './styles/workspace/artifacts.css';

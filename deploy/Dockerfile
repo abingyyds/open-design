@@ -81,6 +81,7 @@ COPY plugins/_official ./plugins/_official
 FROM ${RUNTIME_IMAGE}
 
 RUN apk add --no-cache tini poppler-utils bash git && \
+    npm install -g @openai/codex && \
     addgroup -S -g 1001 open-design && \
     adduser -S -D -H -u 1001 -G open-design open-design
 
@@ -100,16 +101,22 @@ COPY --from=build --chown=open-design:open-design /app/assets/community-pets ./a
 # via the same registry path third-party plugins use.
 COPY --from=build --chown=open-design:open-design /app/plugins/_official ./plugins/_official
 
-RUN mkdir -p /app/.od && \
-    chown -R open-design:open-design /app
+RUN mkdir -p /app/.od /data && \
+    chown -R open-design:open-design /app /data
 
 ENV NODE_ENV=production
 ENV NODE_OPTIONS=--max-old-space-size=192
 ENV OD_BIND_HOST=0.0.0.0
 ENV OD_PORT=7456
+ENV OD_DATA_DIR=/data
+ENV OD_PLATFORM_ENABLED=1
+ENV OD_DISABLE_API_AUTH=1
+ENV OD_CODEX_SANDBOX=danger-full-access
+ENV SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
+ENV OD_SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
 
 EXPOSE 7456
 
 USER open-design
 ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["node", "apps/daemon/dist/cli.js", "--no-open"]
+CMD ["sh", "-lc", "export OD_PORT=\"${PORT:-${OD_PORT:-7456}}\"; exec node apps/daemon/dist/cli.js --no-open"]
