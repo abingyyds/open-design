@@ -10,6 +10,7 @@ const DEFAULT_PUBLIC_SUBROUTER_BASE_URL = 'https://api.subrouter.com';
 const SESSION_COOKIE = 'od_platform_session';
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const AUTO_KEY_PREFIX = 'open-design-auto';
+const CODEX_PLATFORM_PROVIDER_ID = 'open_design_platform';
 
 export class PlatformError extends Error {
   status: number;
@@ -347,6 +348,26 @@ function slug(value: string, fallback: string): string {
 
 function userDataDir(dataDir: string, userId: string): string {
   return path.join(dataDir, 'users', slug(userId, 'user'));
+}
+
+function tomlBasicString(value: string): string {
+  return JSON.stringify(String(value));
+}
+
+function writeCodexPlatformConfig(home: string, baseUrl: string, model: string): void {
+  const lines = [
+    `model_provider = ${tomlBasicString(CODEX_PLATFORM_PROVIDER_ID)}`,
+    ...(model ? [`model = ${tomlBasicString(model)}`] : []),
+    'disable_response_storage = true',
+    '',
+    `[model_providers.${CODEX_PLATFORM_PROVIDER_ID}]`,
+    `name = ${tomlBasicString('Open Design Platform')}`,
+    `base_url = ${tomlBasicString(baseUrl)}`,
+    'wire_api = "responses"',
+    'requires_openai_auth = true',
+    '',
+  ];
+  fs.writeFileSync(path.join(home, 'config.toml'), lines.join('\n'), 'utf8');
 }
 
 export class SubrouterPlatform {
@@ -713,12 +734,14 @@ export class SubrouterPlatform {
     if (!apiKey) throw new PlatformError('当前账号未准备好模型调用密钥，请重新登录');
     const baseUrl = gatewayBaseUrl(row.subrouter_base_url);
     const home = path.join(userDataDir(this.dataDir, userId), 'codex-home');
+    const model = String(row.default_model || '');
     fs.mkdirSync(home, { recursive: true });
+    writeCodexPlatformConfig(home, baseUrl, model);
     return {
       userId,
       apiKey,
       baseUrl,
-      model: String(row.default_model || ''),
+      model,
       agentEnv: {
         OPENAI_BASE_URL: baseUrl,
         OPENAI_API_KEY: apiKey,
@@ -927,4 +950,3 @@ export function registerSubrouterPlatformRoutes(app: Express, platform: Subroute
     }
   });
 }
-
