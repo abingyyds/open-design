@@ -700,6 +700,44 @@ describe('isLocalSameOrigin: OD_ALLOWED_ORIGINS bypass for reverse-proxy deploym
   });
 });
 
+describe('isAllowedBrowserOrigin: hosted platform same-host origins', () => {
+  it('accepts HTTPS same-host requests even when the daemon listens on an internal port', () => {
+    expect(
+      isAllowedBrowserOrigin(
+        'https://open-design-production-5b51.up.railway.app',
+        'open-design-production-5b51.up.railway.app',
+        [7456],
+        '0.0.0.0',
+        [],
+      ),
+    ).toBe(true);
+  });
+
+  it('still rejects attacker origins targeting the hosted app host', () => {
+    expect(
+      isAllowedBrowserOrigin(
+        'https://attacker.example',
+        'open-design-production-5b51.up.railway.app',
+        [7456],
+        '0.0.0.0',
+        [],
+      ),
+    ).toBe(false);
+  });
+
+  it('requires the Origin port to match the Host header when one is explicit', () => {
+    expect(
+      isAllowedBrowserOrigin(
+        'https://open-design-production-5b51.up.railway.app',
+        'open-design-production-5b51.up.railway.app:8443',
+        [7456],
+        '0.0.0.0',
+        [],
+      ),
+    ).toBe(false);
+  });
+});
+
 // Firefox and Chrome omit the Origin header on same-origin GET requests per
 // the Fetch spec. When the daemon runs behind a remote-access proxy whose
 // public hostname is listed in OD_ALLOWED_ORIGINS, those legitimate

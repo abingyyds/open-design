@@ -135,6 +135,19 @@ export function isAllowedBrowserOrigin(
 
   const requestHost = parseHostHeader(hostHeader);
   if (!requestHost) return false;
+  // Hosted platforms and TLS-terminating proxies expose the app at a public
+  // DNS origin such as https://example.com while forwarding to the daemon on
+  // an internal port. When that browser Origin host exactly matches the HTTP
+  // Host header, this is still same-origin even though the external port is
+  // the scheme default (443/80), not the daemon listener port. Keep IP literal
+  // hosts on the stricter local/LAN path below.
+  if (
+    parsedOrigin.host === requestHost.host &&
+    parsedOrigin.port === '' &&
+    !isIpLiteralHostname(parsedOrigin.hostname)
+  ) {
+    return true;
+  }
 
   const schemes = ['http', 'https'];
   const loopbackHosts = ['127.0.0.1', 'localhost', '[::1]'];
