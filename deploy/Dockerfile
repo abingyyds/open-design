@@ -80,7 +80,7 @@ COPY plugins/_official ./plugins/_official
 
 FROM ${RUNTIME_IMAGE}
 
-RUN apk add --no-cache tini poppler-utils bash git && \
+RUN apk add --no-cache tini poppler-utils bash git su-exec && \
     npm install -g @openai/codex && \
     addgroup -S -g 1001 open-design && \
     adduser -S -D -H -u 1001 -G open-design open-design
@@ -117,6 +117,5 @@ ENV OD_SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
 
 EXPOSE 7456
 
-USER open-design
 ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["sh", "-lc", "export OD_PORT=\"${PORT:-${OD_PORT:-7456}}\"; exec node apps/daemon/dist/cli.js --no-open"]
+CMD ["sh", "-lc", "set -eu; export OD_PORT=\"${PORT:-${OD_PORT:-7456}}\"; export OD_DATA_DIR=\"${OD_DATA_DIR:-/data}\"; if [ \"$OD_DATA_DIR\" = \"/\" ]; then echo \"OD_DATA_DIR must not be /\" >&2; exit 1; fi; mkdir -p \"$OD_DATA_DIR\"; chown -R open-design:open-design \"$OD_DATA_DIR\"; exec su-exec open-design node apps/daemon/dist/cli.js --no-open"]
