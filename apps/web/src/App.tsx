@@ -69,6 +69,7 @@ import {
   loginPlatform,
   logoutPlatform,
   setPlatformModel,
+  PlatformApiError,
   type PlatformModel,
   type PlatformUser,
 } from './providers/platform';
@@ -1430,10 +1431,10 @@ function AppInner() {
   );
 
   const handlePlatformLogin = useCallback(
-    async (username: string, password: string) => {
+    async (username: string, password: string, twoFactorCode?: string) => {
       setPlatformState((current) => ({ ...current, error: null }));
       try {
-        const result = await loginPlatform(username, password);
+        const result = await loginPlatform(username, password, twoFactorCode);
         const defaultModel = result.defaultModel || result.models[0]?.id || '';
         setPlatformState({
           loaded: true,
@@ -2624,10 +2625,12 @@ function PlatformLoginPanel({
   onLogin,
 }: {
   error: string | null;
-  onLogin: (username: string, password: string) => Promise<void>;
+  onLogin: (username: string, password: string, twoFactorCode?: string) => Promise<void>;
 }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [twoFactorCode, setTwoFactorCode] = useState('');
+  const [requiresTwoFactor, setRequiresTwoFactor] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
 
@@ -2638,10 +2641,17 @@ function PlatformLoginPanel({
       setLocalError('请输入账号和密码');
       return;
     }
+    if (requiresTwoFactor && !twoFactorCode.trim()) {
+      setLocalError('请输入双重验证码');
+      return;
+    }
     setSubmitting(true);
     try {
-      await onLogin(username.trim(), password);
+      await onLogin(username.trim(), password, requiresTwoFactor ? twoFactorCode : undefined);
     } catch (err) {
+      if (err instanceof PlatformApiError && err.code === 'TWO_FACTOR_REQUIRED') {
+        setRequiresTwoFactor(true);
+      }
       setLocalError(err instanceof Error ? err.message : '登录失败');
     } finally {
       setSubmitting(false);
@@ -2677,6 +2687,18 @@ function PlatformLoginPanel({
             placeholder="请输入密码"
           />
         </label>
+        {requiresTwoFactor ? (
+          <label>
+            <span>双重验证码</span>
+            <input
+              autoComplete="one-time-code"
+              inputMode="numeric"
+              value={twoFactorCode}
+              onChange={(event) => setTwoFactorCode(event.target.value)}
+              placeholder="输入 2FA 验证码或备用码"
+            />
+          </label>
+        ) : null}
         {localError || error ? (
           <div className="platform-login-form__error" role="alert">
             {localError ?? error}

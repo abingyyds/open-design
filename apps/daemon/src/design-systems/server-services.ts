@@ -172,7 +172,10 @@ export function createDesignSystemServerServices({
     return summary?.status !== 'draft';
   }
 
-  async function validateProjectDesignSystemId(id: unknown) {
+  async function validateProjectDesignSystemId(
+    id: unknown,
+    options: { platformUserId?: string | null } = {},
+  ) {
     if (id === undefined || id === null || id === '') return { ok: true, id: null };
     if (typeof id !== 'string') {
       return {
@@ -184,6 +187,17 @@ export function createDesignSystemServerServices({
     const systems = await listAllDesignSystems();
     const summary = systems.find((system) => system.id === id);
     if (!summary) {
+      return {
+        ok: false,
+        code: 'DESIGN_SYSTEM_NOT_FOUND',
+        message: 'design system not found',
+      };
+    }
+    if (
+      options.platformUserId &&
+      summary.source === 'user' &&
+      (summary as DesignSystemSummary).platformUserId !== options.platformUserId
+    ) {
       return {
         ok: false,
         code: 'DESIGN_SYSTEM_NOT_FOUND',
@@ -237,7 +251,11 @@ export function createDesignSystemServerServices({
     return userDesignSystemWorkspaceProjectId(id);
   }
 
-  async function ensureUserDesignSystemWorkspaceProject(dbHandle: Database.Database, id: string) {
+  async function ensureUserDesignSystemWorkspaceProject(
+    dbHandle: Database.Database,
+    id: string,
+    options: { platformUserId?: string | null } = {},
+  ) {
     const systems = await listAllDesignSystems();
     const summary = systems.find((s) => s.id === id && s.source === 'user');
     if (!summary) return null;
@@ -250,8 +268,18 @@ export function createDesignSystemServerServices({
       importedFrom: 'design-system',
       entryFile: 'DESIGN.md',
       sourceFileName: id,
+      ...(options.platformUserId ? { platformUserId: options.platformUserId } : {}),
     };
     const existing = projects.getProject(dbHandle, projectId);
+    if (
+      existing &&
+      options.platformUserId &&
+      existing.metadata?.platformUserId !== options.platformUserId
+    ) {
+      // Do not let one hosted user claim or mutate a workspace project that
+      // belongs to another tenant (or a legacy unowned tenant).
+      return null;
+    }
     const projectName = summary.title ?? id;
     const project = existing
       ? projects.updateProject(dbHandle, projectId, {

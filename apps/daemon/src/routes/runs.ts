@@ -513,7 +513,14 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     try {
       requestBody = preparePlatformRunBody(req, requestBody);
     } catch (err) {
-      return sendApiError(res, 401, 'PLATFORM_LOGIN_REQUIRED', '请先登录平台账号');
+      const status = Number((err as any)?.status) || 401;
+      const code = typeof (err as any)?.code === 'string'
+        ? (err as any).code
+        : 'PLATFORM_LOGIN_REQUIRED';
+      const message = err instanceof Error && err.message && err.message !== 'PLATFORM_LOGIN_REQUIRED'
+        ? err.message
+        : '请先登录平台账号';
+      return sendApiError(res, status, code, message);
     }
     const mediaExecution = parseMediaExecutionPolicyInput(requestBody.mediaExecution);
     if (!mediaExecution.ok) {
@@ -1446,7 +1453,14 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     try {
       requestBody = preparePlatformRunBody(req, requestBody);
     } catch (err) {
-      return sendApiError(res, 401, 'PLATFORM_LOGIN_REQUIRED', '请先登录平台账号');
+      const status = Number((err as any)?.status) || 401;
+      const code = typeof (err as any)?.code === 'string'
+        ? (err as any).code
+        : 'PLATFORM_LOGIN_REQUIRED';
+      const message = err instanceof Error && err.message && err.message !== 'PLATFORM_LOGIN_REQUIRED'
+        ? err.message
+        : '请先登录平台账号';
+      return sendApiError(res, status, code, message);
     }
     const mediaExecution = parseMediaExecutionPolicyInput(requestBody.mediaExecution);
     if (!mediaExecution.ok) {

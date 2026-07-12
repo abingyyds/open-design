@@ -1329,7 +1329,10 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
       if (skipDiscoveryBrief !== undefined && typeof skipDiscoveryBrief !== 'boolean') {
         return sendApiError(res, 400, 'BAD_REQUEST', 'skipDiscoveryBrief must be a boolean');
       }
-      const designSystemValidation = await validateProjectDesignSystemId(designSystemId);
+      const designSystemValidation = await validateProjectDesignSystemId(
+        designSystemId,
+        { platformUserId: platform?.enabled ? platform.currentUser?.(req)?.id ?? null : null },
+      );
       if (!designSystemValidation.ok) {
         return sendApiError(
           res,
@@ -1668,7 +1671,10 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
         return sendApiError(res, 400, 'BAD_REQUEST', 'customInstructions exceeds 5 000 character limit');
       }
       if (Object.prototype.hasOwnProperty.call(patch, 'designSystemId')) {
-        const designSystemValidation = await validateProjectDesignSystemId(patch.designSystemId);
+        const designSystemValidation = await validateProjectDesignSystemId(
+          patch.designSystemId,
+          { platformUserId: platform?.enabled ? platform.currentUser?.(req)?.id ?? null : null },
+        );
         if (!designSystemValidation.ok) {
           return sendApiError(
             res,
@@ -1685,6 +1691,18 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
           return sendApiError(res, 400, skillValidation.code, skillValidation.message);
         }
         patch.skillId = skillValidation.id;
+      }
+      if (platform?.enabled) {
+        const platformUser = platform.currentUser?.(req);
+        if (!platformUser?.id) {
+          return sendApiError(res, 401, 'PLATFORM_LOGIN_REQUIRED', '请先登录平台账号');
+        }
+        const existing = getProject(db, req.params.id);
+        patch.metadata = {
+          ...(existing?.metadata ?? {}),
+          ...(patch.metadata && typeof patch.metadata === 'object' ? patch.metadata : {}),
+          platformUserId: platformUser.id,
+        };
       }
       const project = updateProject(db, req.params.id, patch);
       if (!project)

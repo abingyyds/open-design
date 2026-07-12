@@ -92,10 +92,47 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
   } = ctx.resources;
   const { isLocalSameOrigin, resolvedPortRef, sendApiError } = ctx.http;
   const platform = ctx.platform;
+  const platformUserForRequest = (req: any): { id: string } | null => {
+    if (!platform?.enabled) return null;
+    const user = platform.currentUser?.(req);
+    return user?.id ? { id: String(user.id) } : null;
+  };
+  const designSystemVisible = (req: any, designSystem: any): boolean => {
+    if (!platform?.enabled) return true;
+    if (designSystem?.source !== 'user') return true;
+    const user = platformUserForRequest(req);
+    return Boolean(user?.id && designSystem?.platformUserId === user.id);
+  };
+  const stampImportedDesignSystemOwner = async (dirId: string, userId: string): Promise<void> => {
+    if (!/^[A-Za-z0-9._-]{1,160}$/.test(dirId)) return;
+    const metadataPath = path.join(USER_DESIGN_SYSTEMS_DIR, dirId, 'metadata.json');
+    let metadata: Record<string, unknown> = {};
+    try {
+      const raw = await fs.promises.readFile(metadataPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) metadata = parsed;
+    } catch {
+      // Imported systems may not have metadata yet.
+    }
+    await fs.promises.writeFile(
+      metadataPath,
+      `${JSON.stringify({ ...metadata, platformUserId: userId }, null, 2)}\n`,
+      'utf8',
+    );
+  };
   const requireLocalOrigin = (req: any, res: any) => {
     if (isLocalSameOrigin(req, resolvedPortRef.current)) return true;
     sendApiError(res, 403, 'FORBIDDEN', 'local origin required');
     return false;
+  };
+  const requireDesignSystemOrigin = (req: any, res: any) => {
+    // In hosted platform mode the browser origin has already passed the
+    // daemon's public-origin guard and the request carries a tenant session.
+    // The local-origin helper intentionally rejects public reverse-proxy hosts,
+    // so allow authenticated platform users through for cloud design-system
+    // import/install operations.
+    if (platform?.enabled && platform.currentUser?.(req)) return true;
+    return requireLocalOrigin(req, res);
   };
   const importedDesignSystemResponse = async <T extends { id: string }>(designSystem: T) => {
     let tokenContractRebuild: DesignSystemTokenContractRebuildJobResponse | undefined;
@@ -120,7 +157,7 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
       buildArgs,
       listModels,
       fetchModels,
-      fallbackModels,
+      fallbackModels: _fallbackModels,
       helpArgs,
       capabilityFlags,
       fallbackBins,
@@ -132,25 +169,35 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
       ...rest
     } = def;
     let models = [];
+    let runtimeModel = '';
     try {
       const runtime = platform.runtimeForUser(user.id);
+      runtimeModel = runtime.model || '';
       const result = await platform.fetchModels(user.id);
       models = Array.isArray(result.models)
-        ? result.models.map((model: any) => ({ id: model.id, label: model.label ?? model.id })).filter((model: any) => model.id)
+        ? result.models
+            .filter((model: any) => !model.type || model.type === 'text')
+            .map((model: any) => ({ id: model.id, label: model.label ?? model.id }))
+            .filter((model: any) => model.id)
         : [];
-      if (models.length === 0 && runtime.model) {
-        models = [{ id: runtime.model, label: runtime.model }];
+      if (models.length === 0 && runtimeModel) {
+        models = [{ id: runtimeModel, label: runtimeModel }];
       }
     } catch {
       models = [];
     }
+    // Never expose the Codex package's static OpenAI fallback catalogue in
+    // platform mode. Those models are not necessarily present in the
+    // SubRouter user's subscription and selecting one would fail only after
+    // the run had already started. An empty list is intentional: the UI can
+    // show an unavailable platform runtime and ask the user to refresh/login.
     return {
       ...rest,
-      models: models.length > 0 ? models : (fallbackModels ?? [{ id: 'default', label: 'Default' }]),
+      models,
       modelsSource: 'live',
-      available: true,
+      available: models.length > 0,
       path: 'codex',
-      authStatus: 'authenticated',
+      authStatus: models.length > 0 ? 'authenticated' : 'error',
     };
   }
 
@@ -449,11 +496,13 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
     }
   });
 
-  app.get('/api/design-systems', async (_req, res) => {
+  app.get('/api/design-systems', async (req, res) => {
     try {
       const systems = await listAllDesignSystems();
       res.json({
-        designSystems: systems.map(({ body, ...rest }) => rest),
+        designSystems: systems
+          .filter((system) => designSystemVisible(req, system))
+          .map(({ body, platformUserId: _platformUserId, ...rest }) => rest),
       });
     } catch (err: any) {
       res.status(500).json({ error: String(err) });
@@ -709,13 +758,15 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
   });
 
   app.post('/api/design-systems/install', async (req, res) => {
-    if (!requireLocalOrigin(req, res)) return;
+    if (!requireDesignSystemOrigin(req, res)) return;
     try {
       const result = await installFromTarget(req.body, USER_DESIGN_SYSTEMS_DIR, 'design-system');
       if (!result.ok) return res.status(400).json({ error: result.error });
       if (typeof result.dir !== 'string' || !result.dir) {
         return res.status(500).json({ error: 'design system install did not return an installation directory' });
       }
+      const platformUser = platformUserForRequest(req);
+      if (platformUser) await stampImportedDesignSystemOwner(path.basename(result.dir), platformUser.id);
       const systems = await listAllDesignSystems();
       const designSystemId = path.basename(fs.realpathSync.native(result.dir));
       const designSystem = findUserDesignSystemInCatalog(systems, designSystemId);
@@ -729,7 +780,7 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
   });
 
   app.post('/api/design-systems/import/local', async (req, res) => {
-    if (!requireLocalOrigin(req, res)) return;
+    if (!requireDesignSystemOrigin(req, res)) return;
     try {
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const inputPath =
@@ -774,6 +825,7 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
         ...(typeof body.name === 'string' ? { name: body.name } : {}),
         ...(importMode ? { importMode } : {}),
         ...(craftApplies ? { craftApplies } : {}),
+        ...(platformUserForRequest(req)?.id ? { platformUserId: platformUserForRequest(req)!.id } : {}),
         reservedIds: designSystemDirIdsFromCatalog(before),
       });
       const systems = await listAllDesignSystems();
@@ -796,7 +848,7 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
   });
 
   app.post('/api/design-systems/import/github', async (req, res) => {
-    if (!requireLocalOrigin(req, res)) return;
+    if (!requireDesignSystemOrigin(req, res)) return;
     try {
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const githubUrl =
@@ -817,6 +869,7 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
           ...(typeof body.branch === 'string' ? { branch: body.branch } : {}),
           ...(importMode ? { importMode } : {}),
           ...(craftApplies ? { craftApplies } : {}),
+          ...(platformUserForRequest(req)?.id ? { platformUserId: platformUserForRequest(req)!.id } : {}),
           reservedIds: designSystemDirIdsFromCatalog(before),
         },
       );
@@ -840,7 +893,7 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
   });
 
   app.post('/api/design-systems/import/shadcn', async (req, res) => {
-    if (!requireLocalOrigin(req, res)) return;
+    if (!requireDesignSystemOrigin(req, res)) return;
     try {
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const reference =
@@ -863,6 +916,7 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
           ...(typeof body.name === 'string' ? { name: body.name } : {}),
           ...(importMode ? { importMode } : {}),
           ...(craftApplies ? { craftApplies } : {}),
+          ...(platformUserForRequest(req)?.id ? { platformUserId: platformUserForRequest(req)!.id } : {}),
           reservedIds: designSystemDirIdsFromCatalog(before),
         },
       );
@@ -886,7 +940,12 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
   });
 
   app.delete('/api/design-systems/:id', async (req, res, next) => {
-    if (!requireLocalOrigin(req, res)) return;
+    if (!requireDesignSystemOrigin(req, res)) return;
+    const systems = await listAllDesignSystems();
+    const target = systems.find((system) => system.id === req.params.id || system.id === `user:${req.params.id}`);
+    if (!target || !designSystemVisible(req, target)) {
+      return sendApiError(res, 404, 'NOT_FOUND', 'design system not found');
+    }
     if (req.params.id.startsWith('user:')) {
       return next();
     }

@@ -49,6 +49,7 @@ export type DesignSystemGenerationJob = {
   updatedAt: string;
   completedAt?: string;
   designSystemId?: string;
+  platformUserId?: string;
   revisionId?: string;
   error?: string;
   message?: string;
@@ -135,6 +136,7 @@ export function createDesignSystemGenerationJobStore(options: StoreOptions) {
       createdAt: now,
       updatedAt: now,
       message: 'Queued',
+      ...(input.platformUserId ? { platformUserId: input.platformUserId } : {}),
     };
     jobs.set(job.id, job);
     void run(job, input);

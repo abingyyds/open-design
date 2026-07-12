@@ -3724,7 +3724,15 @@ export async function startServer({
   // hits a populated cache even if /api/agents hasn't been called yet.
   void readAppConfig(RUNTIME_DATA_DIR)
     .then((config) => {
-      orbitService.configure(config.orbit);
+      // Orbit owns a daemon-global connector context and its scheduled runner
+      // has no browser session to select a SubRouter tenant. Do not let a
+      // hosted platform process silently run one user's (or the local
+      // operator's) model/connector configuration in the background.
+      orbitService.configure(
+        subrouterPlatform.enabled
+          ? { ...(config.orbit ?? {}), enabled: false }
+          : config.orbit,
+      );
       return detectAgents(config.agentCliEnv ?? {});
     })
     .catch(() => detectAgents().catch(() => {}));
@@ -4154,6 +4162,7 @@ export async function startServer({
     projectFiles: projectFileDeps,
     conversations: conversationDeps,
     auth: authDeps,
+    platform: subrouterPlatform,
   });
   app.post('/api/projects/:id/figma/import', (req, res) => {
     figmaUpload.single('file')(req, res, async (err) => {
@@ -4235,6 +4244,7 @@ export async function startServer({
     conversations: conversationDeps,
     projectFiles: projectFileDeps,
     validation: validationDeps,
+    platform: subrouterPlatform,
   });
 
   // Resource catalog
@@ -4270,6 +4280,7 @@ export async function startServer({
     paths: pathDeps,
     projectStore: projectStoreDeps,
     projectFiles: projectFileDeps,
+    platform: subrouterPlatform,
     designSystems: {
       buildUserDesignSystemArchive,
       createUserDesignSystem,
@@ -4299,6 +4310,7 @@ export async function startServer({
     dataDir: RUNTIME_DATA_DIR,
     db,
     runs: design.runs,
+    platform: subrouterPlatform,
     randomId,
     resolveTranscriptAgent: async () => {
       const config = await readAppConfig(RUNTIME_DATA_DIR);
@@ -4409,6 +4421,7 @@ export async function startServer({
     projectFiles: projectFileDeps,
     conversations: conversationDeps,
     research: researchDeps,
+    platform: subrouterPlatform,
   });
 
   registerVelaRoutes(app, {
@@ -4511,7 +4524,7 @@ export async function startServer({
         const actionPluginId = PLUGIN_SHARE_ACTION_PLUGIN_IDS[action];
         const actionPlugin = getInstalledPlugin(db, actionPluginId);
         if (!actionPlugin) return res.status(409).json({ ok: false, code: 'share-action-plugin-missing', message: `The bundled action plugin "${actionPluginId}" is not installed. Restart the daemon so bundled plugins are registered.` });
-        const now = Date.now(); const id = randomId(); const cid = randomId(); const sourceSlug = githubRepoNameFromPluginName(sourcePlugin.id); const stagedPath = `plugin-source/${sourceSlug}`; const prompt = renderPluginSharePrompt({ action, sourcePlugin, stagedPath }); const metadata = { kind: 'prototype' }; const projectRoot = await ensureProject(PROJECTS_DIR, id, metadata); await copyPluginFolderForProjectContext(sourcePlugin.fsPath, path.join(projectRoot, 'plugin-source', sourceSlug));
+        const now = Date.now(); const id = randomId(); const cid = randomId(); const sourceSlug = githubRepoNameFromPluginName(sourcePlugin.id); const stagedPath = `plugin-source/${sourceSlug}`; const prompt = renderPluginSharePrompt({ action, sourcePlugin, stagedPath }); const platformUser = subrouterPlatform.enabled ? subrouterPlatform.currentUser(req) : null; const metadata = { kind: 'prototype', ...(platformUser?.id ? { platformUserId: platformUser.id } : {}) }; const projectRoot = await ensureProject(PROJECTS_DIR, id, metadata); await copyPluginFolderForProjectContext(sourcePlugin.fsPath, path.join(projectRoot, 'plugin-source', sourceSlug));
         insertProject(db, { id, name: `${PLUGIN_SHARE_ACTION_LABELS[action]}: ${sourcePlugin.title || sourcePlugin.id}`, skillId: null, designSystemId: null, pendingPrompt: prompt, metadata, createdAt: now, updatedAt: now });
         insertConversation(db, { id: cid, projectId: id, title: null, createdAt: now, updatedAt: now });
         const registry = await loadPluginRegistryView(); const connectorProbe = buildConnectorProbe(connectorService); const resolved = resolvePluginSnapshot({ db, body: { pluginId: actionPluginId, pluginInputs: { source_plugin_id: sourcePlugin.id, source_plugin_title: sourcePlugin.title || sourcePlugin.id, source_plugin_version: sourcePlugin.version, source_plugin_path: sourcePlugin.fsPath, plugin_context_path: stagedPath }, locale: typeof body.locale === 'string' ? body.locale : undefined }, projectId: id, conversationId: cid, registry, connectorProbe });
@@ -4985,8 +4998,20 @@ export async function startServer({
     if (effectiveDesignSystemId) {
       let systems = await listAllDesignSystems();
       let summary = systems.find((s) => s.id === effectiveDesignSystemId);
+      if (
+        subrouterPlatform.enabled &&
+        summary?.source === 'user' &&
+        summary.platformUserId !== chatBody.platformUserId
+      ) {
+        return design.runs.fail(run, 'DESIGN_SYSTEM_NOT_FOUND', 'design system not found');
+      }
       if (summary?.source === 'user') {
-        await ensureUserDesignSystemWorkspaceProject(db, effectiveDesignSystemId);
+        await ensureUserDesignSystemWorkspaceProject(db, effectiveDesignSystemId, {
+          platformUserId:
+            subrouterPlatform.enabled && typeof chatBody.platformUserId === 'string'
+              ? chatBody.platformUserId
+              : null,
+        });
         systems = await listAllDesignSystems();
         summary = systems.find((s) => s.id === effectiveDesignSystemId);
       }
@@ -5837,7 +5862,7 @@ export async function startServer({
       } catch (err) {
         return design.runs.fail(
           run,
-          'PLATFORM_LOGIN_REQUIRED',
+          typeof err?.code === 'string' ? err.code : 'PLATFORM_LOGIN_REQUIRED',
           err && err.message ? err.message : '请先登录平台账号',
         );
       }
@@ -9217,7 +9242,9 @@ export async function startServer({
       discardUnstarted,
     };
   });
-  routineService.start();
+  if (!subrouterPlatform.enabled) {
+    routineService.start();
+  }
 
   assertServerContextSatisfiesRoutes({
     db,
@@ -9280,6 +9307,7 @@ export async function startServer({
     db,
     paths: { RUNTIME_DATA_DIR },
     routines: { routineService },
+    platform: subrouterPlatform,
   });
 
   // proxy routes (anthropic / openai / azure / google / ollama) live

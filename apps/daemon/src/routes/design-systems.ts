@@ -30,6 +30,7 @@ type AvailableDesignSystemSummary = DesignSystemSummary & {
 };
 
 export interface RegisterDesignSystemRoutesDeps extends RouteDeps<'db' | 'paths' | 'projectFiles' | 'projectStore'> {
+  platform?: { enabled?: boolean; currentUser?: (req: unknown) => { id?: string } | null };
   designSystems: {
     buildUserDesignSystemArchive: (
       root: string,
@@ -37,7 +38,7 @@ export interface RegisterDesignSystemRoutesDeps extends RouteDeps<'db' | 'paths'
     ) => Promise<{ buffer: Buffer; baseName: string; title: string } | null>;
     createUserDesignSystem: (root: string, input: UserDesignSystemInput) => Promise<DesignSystemSummary>;
     deleteUserDesignSystem: (root: string, id: string) => Promise<boolean>;
-    ensureUserDesignSystemWorkspaceProject: (db: DbHandle, id: string) => Promise<DesignSystemWorkspaceProject | null>;
+    ensureUserDesignSystemWorkspaceProject: (db: DbHandle, id: string, options?: { platformUserId?: string | null }) => Promise<DesignSystemWorkspaceProject | null>;
     listAllDesignSystems: () => Promise<AvailableDesignSystemSummary[]>;
     listUserDesignSystemFiles: (root: string, id: string) => Promise<DesignSystemFileSummary[] | null>;
     listUserDesignSystemRevisions: (root: string, id: string) => Promise<DesignSystemRevision[] | null>;
@@ -98,10 +99,33 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
     updateUserDesignSystemRevisionStatus,
   } = ctx.designSystems;
   const designSystemGenerationJobs = ctx.generationJobs;
+  const platform = ctx.platform;
+
+  function platformDesignSystemVisible(req: any, summary: any): boolean {
+    if (!platform?.enabled) return true;
+    if (summary?.source !== 'user') return true;
+    const user = platform.currentUser?.(req);
+    return Boolean(user?.id && summary?.platformUserId === user.id);
+  }
+
+  async function requireVisibleDesignSystem(req: any, res: any, id: string): Promise<any | null> {
+    const systems = await listAllDesignSystems();
+    const summary = systems.find((system) => system.id === id);
+    if (!summary || !platformDesignSystemVisible(req, summary)) {
+      res.status(404).json({ error: 'design system not found' });
+      return null;
+    }
+    return summary;
+  }
 
   app.post('/api/design-systems', async (req, res) => {
     try {
-      const created = await createUserDesignSystem(USER_DESIGN_SYSTEMS_DIR, req.body || {});
+      const platformUser = platform?.enabled ? platform.currentUser?.(req) : null;
+      const input = {
+        ...(req.body || {}),
+        ...(platformUser?.id ? { platformUserId: platformUser.id } : {}),
+      };
+      const created = await createUserDesignSystem(USER_DESIGN_SYSTEMS_DIR, input);
       res.status(201).json({ ...created as object, designSystem: created });
     } catch (err) {
       res.status(400).json({ error: String(err) });
@@ -110,7 +134,12 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.post('/api/design-systems/generation-jobs', async (req, res) => {
     try {
-      const job = designSystemGenerationJobs.start(req.body || {});
+      const platformUser = platform?.enabled ? platform.currentUser?.(req) : null;
+      const input = {
+        ...(req.body || {}),
+        ...(platformUser?.id ? { platformUserId: platformUser.id } : {}),
+      };
+      const job = designSystemGenerationJobs.start(input);
       res.status(202).json({ job });
     } catch (err) {
       res.status(400).json({ error: String(err) });
@@ -123,6 +152,13 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
       if (!job) {
         return res.status(404).json({ error: 'design system generation job not found' });
       }
+      if (
+        platform?.enabled &&
+        job.platformUserId !== platform.currentUser?.(req)?.id
+      ) {
+        return res.status(404).json({ error: 'design system generation job not found' });
+      }
+      if (job.designSystemId && !(await requireVisibleDesignSystem(req, res, job.designSystemId))) return;
       res.json({ job });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -131,6 +167,7 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.post('/api/design-systems/:id/revision-jobs', async (req, res) => {
     try {
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
       const feedback = typeof req.body?.feedback === 'string' ? req.body.feedback : '';
       if (!feedback.trim()) return res.status(400).json({ error: 'feedback is required' });
       const job = designSystemGenerationJobs.revise({
@@ -147,6 +184,7 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.post('/api/design-systems/:id/token-contract/rebuild-jobs', async (req, res) => {
     try {
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
       const preparation = await prepareDesignTokenContractRebuild(
         USER_DESIGN_SYSTEMS_DIR,
         req.params.id,
@@ -171,6 +209,7 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.get('/api/design-systems/:id/revisions', async (req, res) => {
     try {
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
       const revisions = await listUserDesignSystemRevisions(
         USER_DESIGN_SYSTEMS_DIR,
         req.params.id,
@@ -186,6 +225,7 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.patch('/api/design-systems/:id/revisions/:revisionId', async (req, res) => {
     try {
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
       const status = typeof req.body?.status === 'string' ? req.body.status : '';
       if (status !== 'accepted' && status !== 'rejected') {
         return res.status(400).json({ error: 'status must be accepted or rejected' });
@@ -209,13 +249,17 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
     try {
       const systems = await listAllDesignSystems();
       const summary = systems.find((s) => s.id === req.params.id);
+      if (!summary || !platformDesignSystemVisible(req, summary)) {
+        return res.status(404).json({ error: 'design system not found' });
+      }
       const projectBody = await readDesignSystemWorkspaceTextFile(db, summary, 'DESIGN.md');
       const body = projectBody ?? await readAvailableDesignSystem(req.params.id);
-      if (body === null || !summary) {
+      if (body === null) {
         return res.status(404).json({ error: 'design system not found' });
       }
       const packageInfo = await readAvailableDesignSystemPackageInfo(req.params.id);
-      const detail = { ...summary, body, ...(packageInfo ? { packageInfo } : {}) };
+      const { platformUserId: _platformUserId, ...publicSummary } = summary;
+      const detail = { ...publicSummary, body, ...(packageInfo ? { packageInfo } : {}) };
       res.json({ ...detail, designSystem: detail });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -224,6 +268,7 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.get('/api/design-systems/:id/preview', async (req, res) => {
     try {
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
       const body = await readAvailableDesignSystem(req.params.id);
       if (body === null) return res.status(404).type('text/plain').send('not found');
       const html = renderDesignSystemPreview(req.params.id, body);
@@ -235,6 +280,7 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.get('/api/design-systems/:id/showcase', async (req, res) => {
     try {
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
       const body = await readAvailableDesignSystem(req.params.id);
       if (body === null) return res.status(404).type('text/plain').send('not found');
       const html = renderDesignSystemShowcase(req.params.id, body);
@@ -246,6 +292,7 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.get('/api/design-systems/:id/static', async (req, res) => {
     try {
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
       const requestedPath = typeof req.query.path === 'string' ? req.query.path : '';
       const file = await readAvailableDesignSystemStaticFile(req.params.id, requestedPath);
       if (!file) return res.status(404).type('text/plain').send('not found');
@@ -259,7 +306,11 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.post('/api/design-systems/:id/workspace', async (req, res) => {
     try {
-      const workspace = await ensureUserDesignSystemWorkspaceProject(db, req.params.id);
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
+      const platformUser = platform?.enabled ? platform.currentUser?.(req) : null;
+      const workspace = await ensureUserDesignSystemWorkspaceProject(db, req.params.id, {
+        platformUserId: platformUser?.id ?? null,
+      });
       if (!workspace) {
         return res.status(404).json({ error: 'editable design system not found' });
       }
@@ -271,6 +322,7 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.get('/api/design-systems/:id/files', async (req, res) => {
     try {
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
       const files = await listUserDesignSystemFiles(USER_DESIGN_SYSTEMS_DIR, req.params.id);
       if (!files) {
         return res.status(404).json({ error: 'editable design system not found' });
@@ -283,6 +335,7 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.get('/api/design-systems/:id/file', async (req, res) => {
     try {
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
       const requestedPath = typeof req.query.path === 'string' ? req.query.path : '';
       const file = await readUserDesignSystemFile(
         USER_DESIGN_SYSTEMS_DIR,
@@ -303,6 +356,7 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
   // null and surface as 404.
   app.get('/api/design-systems/:id/archive', async (req, res) => {
     try {
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
       const archive = await buildUserDesignSystemArchive(USER_DESIGN_SYSTEMS_DIR, req.params.id);
       if (!archive) {
         return res.status(404).json({ error: 'downloadable design system not found' });
@@ -326,10 +380,16 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.patch('/api/design-systems/:id', async (req, res) => {
     try {
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
+      const platformUser = platform?.enabled ? platform.currentUser?.(req) : null;
+      const input = {
+        ...(req.body || {}),
+        ...(platformUser?.id ? { platformUserId: platformUser.id } : {}),
+      };
       const updated = await updateUserDesignSystem(
         USER_DESIGN_SYSTEMS_DIR,
         req.params.id,
-        req.body || {},
+        input,
       );
       if (!updated) {
         return res.status(404).json({ error: 'editable design system not found' });
@@ -342,6 +402,7 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
 
   app.delete('/api/design-systems/:id', async (req, res) => {
     try {
+      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
       const ok = await deleteUserDesignSystem(USER_DESIGN_SYSTEMS_DIR, req.params.id);
       if (!ok) {
         return res.status(404).json({ error: 'editable design system not found' });

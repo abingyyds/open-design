@@ -67,6 +67,7 @@ export interface BrandRoutesDeps {
   randomId?: () => string;
   /** Selected agent identity for programmatic transcript rows. */
   resolveTranscriptAgent?: () => Promise<{ agentId?: string | null; agentName?: string | null } | null>;
+  platform?: { enabled?: boolean; currentUser?: (req: Request) => { id?: string } | null };
 }
 
 const LOGO_EXT_PRIORITY = ['.svg', '.png', '.webp', '.jpg', '.jpeg', '.gif', '.ico'];
@@ -76,12 +77,27 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
   const { brandsRoot, userDesignSystemsRoot, projectsRoot, skillsRoot, dataDir, db, randomId } = deps;
   const activeProgrammaticBrandExtractions = new Map<string, AbortController>();
 
+  function brandVisible(req: Request, id: string): boolean {
+    if (!deps.platform?.enabled) return true;
+    const user = deps.platform.currentUser?.(req);
+    if (!user?.id) return false;
+    const meta = readBrandDetail(brandsRoot, id)?.meta;
+    const project = meta?.projectId ? getProject(db, meta.projectId) : null;
+    return project?.metadata?.platformUserId === user.id;
+  }
+
+  function requireBrandVisible(req: Request, res: Response): boolean {
+    if (brandVisible(req, String(req.params.id))) return true;
+    res.status(404).json({ error: 'brand not found' });
+    return false;
+  }
+
   // GET /api/brands — list every stored brand as a summary.
-  app.get('/api/brands', (_req: Request, res: Response) => {
+  app.get('/api/brands', (req: Request, res: Response) => {
     try {
       const statusContext = createBrandStatusContext(deps);
       res.json({
-        brands: listBrandSummaries(brandsRoot).map((summary) =>
+        brands: listBrandSummaries(brandsRoot).filter((summary) => brandVisible(req, summary.meta.id)).map((summary) =>
           reconcileBrandSummaryStatus(brandsRoot, summary, statusContext),
         ),
       });
@@ -126,6 +142,8 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
       if (designMd.trim()) startOptions.designMd = designMd;
       if (locale.trim()) startOptions.locale = locale;
       if (randomId) startOptions.randomId = randomId;
+      const platformUser = deps.platform?.enabled ? deps.platform.currentUser?.(req) : null;
+      if (platformUser?.id) startOptions.platformUserId = platformUser.id;
       const transcriptAgent = await deps.resolveTranscriptAgent?.().catch(() => null);
       if (transcriptAgent) startOptions.transcriptAgent = transcriptAgent;
       const result = await startBrandExtraction(startOptions);
@@ -156,6 +174,7 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
   // row: the web marks the message canceled locally, while the daemon aborts
   // pending harvest/finalize work and moves the brand out of extracting.
   app.post('/api/brands/:id/cancel-extraction', (req: Request, res: Response) => {
+    if (!requireBrandVisible(req, res)) return;
     const id = String(req.params.id);
     try {
       const detail = readBrandDetail(brandsRoot, id);
@@ -189,6 +208,7 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
   // current brand.json. The extraction agent calls this (`od brand preview`)
   // after each measurement pass so the kit page fills in live.
   app.post('/api/brands/:id/preview', async (req: Request, res: Response) => {
+    if (!requireBrandVisible(req, res)) return;
     const id = String(req.params.id);
     const projectId =
       typeof req.body?.projectId === 'string' && req.body.projectId.trim()
@@ -220,6 +240,7 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
   // (brand.json + assets in the backing project) as a `user:<id>` design system
   // and mark the brand ready. Called by the agent / `od brand finalize`.
   app.post('/api/brands/:id/finalize', async (req: Request, res: Response) => {
+    if (!requireBrandVisible(req, res)) return;
     const id = String(req.params.id);
     const projectId =
       typeof req.body?.projectId === 'string' && req.body.projectId.trim()
@@ -242,6 +263,8 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
       if (projectId) finalizeOptions.projectId = projectId;
       if (locale) finalizeOptions.locale = locale;
       if (randomId) finalizeOptions.randomId = randomId;
+      const platformUser = deps.platform?.enabled ? deps.platform.currentUser?.(req) : null;
+      if (platformUser?.id) finalizeOptions.platformUserId = platformUser.id;
       const result = await finalizeBrand(finalizeOptions);
       res.json(result);
     } catch (err) {
@@ -256,6 +279,7 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
   // after the user cleared an anti-bot wall, instead of a fresh (blocked) fetch.
   // Registers the `user:<id>` design system and marks the brand `ready`.
   app.post('/api/brands/:id/extract-from-html', async (req: Request, res: Response) => {
+    if (!requireBrandVisible(req, res)) return;
     const id = String(req.params.id);
     const html = typeof req.body?.html === 'string' ? req.body.html : '';
     const css = typeof req.body?.css === 'string' ? req.body.css : '';
@@ -270,6 +294,7 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
         res.status(404).json({ error: 'brand not found' });
         return;
       }
+      const platformUser = deps.platform?.enabled ? deps.platform.currentUser?.(req) : null;
       const result = await extractBrandFromHtml({
         id,
         meta,
@@ -283,6 +308,7 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
         html,
         ...(css.trim() ? { css } : {}),
         ...(baseUrl.trim() ? { baseUrl } : {}),
+        ...(platformUser?.id ? { platformUserId: platformUser.id } : {}),
       });
       if (!result) {
         res
@@ -299,6 +325,7 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
 
   // GET /api/brands/:id — full detail (meta + brand + guide). 404 if missing.
   app.get('/api/brands/:id', (req: Request, res: Response) => {
+    if (!requireBrandVisible(req, res)) return;
     try {
       const detail = readBrandDetail(brandsRoot, String(req.params.id));
       if (!detail) {
@@ -313,6 +340,7 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
 
   // DELETE /api/brands/:id — remove the brand and its registered design system.
   app.delete('/api/brands/:id', async (req: Request, res: Response) => {
+    if (!requireBrandVisible(req, res)) return;
     try {
       await removeBrand(brandsRoot, userDesignSystemsRoot, String(req.params.id));
       res.json({ ok: true });
@@ -323,6 +351,7 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
 
   // GET /api/brands/:id/logo — serve the primary logo image. 404 if none.
   app.get('/api/brands/:id/logo', (req: Request, res: Response) => {
+    if (!requireBrandVisible(req, res)) return;
     try {
       const id = String(req.params.id);
       const logoPath =

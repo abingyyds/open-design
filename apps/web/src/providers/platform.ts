@@ -35,6 +35,18 @@ export type PlatformLoginResponse = PlatformModelsResponse & {
   user: PlatformUser;
 };
 
+export class PlatformApiError extends Error {
+  code: string;
+  status: number;
+
+  constructor(message: string, code = 'PLATFORM_ERROR', status = 400) {
+    super(message);
+    this.name = 'PlatformApiError';
+    this.code = code;
+    this.status = status;
+  }
+}
+
 function platformErrorMessage(payload: unknown, fallback: string): string {
   if (payload && typeof payload === 'object') {
     const record = payload as Record<string, any>;
@@ -46,7 +58,14 @@ function platformErrorMessage(payload: unknown, fallback: string): string {
 
 async function readJsonResponse<T>(response: Response, fallback: string): Promise<T> {
   const payload = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(platformErrorMessage(payload, fallback));
+  if (!response.ok) {
+    const record = payload && typeof payload === 'object' ? payload as Record<string, any> : {};
+    throw new PlatformApiError(
+      platformErrorMessage(payload, fallback),
+      typeof record.error?.code === 'string' ? record.error.code : 'PLATFORM_ERROR',
+      response.status,
+    );
+  }
   return payload as T;
 }
 
@@ -69,12 +88,20 @@ export async function fetchPlatformModels(): Promise<PlatformModelsResponse> {
   return readJsonResponse<PlatformModelsResponse>(response, '模型列表读取失败');
 }
 
-export async function loginPlatform(username: string, password: string): Promise<PlatformLoginResponse> {
+export async function loginPlatform(
+  username: string,
+  password: string,
+  twoFactorCode?: string,
+): Promise<PlatformLoginResponse> {
   const response = await fetch('/api/platform/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({
+      username,
+      password,
+      ...(twoFactorCode?.trim() ? { twoFactorCode: twoFactorCode.trim() } : {}),
+    }),
   });
   return readJsonResponse<PlatformLoginResponse>(response, '登录失败');
 }

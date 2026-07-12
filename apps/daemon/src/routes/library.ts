@@ -56,7 +56,13 @@ import {
 export interface RegisterLibraryRoutesDeps
   extends RouteDeps<
     'db' | 'http' | 'paths' | 'projectStore' | 'projectFiles' | 'conversations' | 'auth'
-  > {}
+  > {
+  platform?: {
+    enabled?: boolean;
+    currentUser?: (req: Request) => { id?: string } | null;
+    projectBelongsToRequest?: (req: Request, project: unknown) => boolean;
+  };
+}
 
 const MAX_REMOTE_BYTES = 25 * 1024 * 1024;
 
@@ -119,6 +125,14 @@ async function fetchRemoteBytes(url: string): Promise<{ bytes: Buffer; mime: str
 
 export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDeps): void {
   const { db } = ctx;
+  const platform = ctx.platform;
+  const requirePlatformProject = (req: Request, res: Response, projectId: string): boolean => {
+    if (!platform?.enabled) return true;
+    const project = ctx.projectStore.getProject(db, projectId);
+    if (platform.projectBelongsToRequest?.(req, project) === true) return true;
+    sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+    return false;
+  };
   const { sendApiError, createSseResponse, requireLocalDaemonRequest, isLocalSameOrigin, resolvedPortRef } =
     ctx.http;
   const { LIBRARY_DIR, PROJECTS_DIR, USER_DESIGN_SYSTEMS_DIR } = ctx.paths;
@@ -534,6 +548,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
     if (!asset) return sendApiError(res, 404, 'NOT_FOUND', 'asset not found');
     const projectId = typeof req.body?.projectId === 'string' ? req.body.projectId : '';
     if (!projectId) return sendApiError(res, 400, 'BAD_REQUEST', 'projectId is required');
+    if (!requirePlatformProject(req, res, projectId)) return;
     try {
       const includeElement = req.body?.includeElement === true;
       const result = await applyAssetToProject(asset, projectId, 'manual-upload', req.body?.dir, includeElement);
@@ -569,7 +584,12 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
       // `prototype` keeps the new project in the design/canvas surface; the
       // back-link to the source asset rides on metadata so the asset's "Open
       // project" affordance can resolve it.
-      const metadata = { kind: 'prototype', odLibraryAssetId: asset.id };
+      const platformUser = platform?.enabled ? platform.currentUser?.(req) : null;
+      const metadata = {
+        kind: 'prototype',
+        odLibraryAssetId: asset.id,
+        ...(platformUser?.id ? { platformUserId: platformUser.id } : {}),
+      };
       insertProject(db, {
         id: projectId,
         name: baseName || 'Captured page',
@@ -627,6 +647,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
     if (!asset) return sendApiError(res, 404, 'NOT_FOUND', 'asset not found');
     const projectId = grant.projectId ?? (typeof req.body?.projectId === 'string' ? req.body.projectId : '');
     if (!projectId) return sendApiError(res, 400, 'BAD_REQUEST', 'projectId is required');
+    if (!requirePlatformProject(req, res, projectId)) return;
     try {
       const includeElement = req.body?.includeElement === true;
       const result = await applyAssetToProject(asset, projectId, 'agent-task', req.body?.dir, includeElement);

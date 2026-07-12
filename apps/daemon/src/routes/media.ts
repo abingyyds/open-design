@@ -21,7 +21,9 @@ const LONG_MEDIA_PROXY_TIMEOUT_MS = 10 * 60 * 1000;
 const AIHUBMIX_CATALOG_TTL_MS = 5 * 60 * 1000;
 const aihubmixCatalogCache = new Map<string, { at: number; models: Array<{ id: string; label: string }> }>();
 
-export interface RegisterMediaRoutesDeps extends RouteDeps<'db' | 'design' | 'http' | 'paths' | 'ids' | 'auth' | 'media' | 'appConfig' | 'orbit' | 'nativeDialogs' | 'projectStore' | 'projectFiles' | 'conversations' | 'research'> {}
+export interface RegisterMediaRoutesDeps extends RouteDeps<'db' | 'design' | 'http' | 'paths' | 'ids' | 'auth' | 'media' | 'appConfig' | 'orbit' | 'nativeDialogs' | 'projectStore' | 'projectFiles' | 'conversations' | 'research'> {
+  platform?: { enabled?: boolean };
+}
 
 export type LegacyMediaRouteGrantDecision =
   | { ok: true; grant: ToolTokenGrant | null }
@@ -74,6 +76,7 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
   const { MEDIA_PROVIDERS, IMAGE_MODELS, VIDEO_MODELS, AUDIO_MODELS_BY_KIND, MEDIA_ASPECTS, VIDEO_LENGTHS_SEC, AUDIO_DURATIONS_SEC, readMaskedConfig, writeConfig, generateMedia, createMediaTask, persistMediaTask, appendTaskProgress, notifyTaskWaiters, getLiveMediaTask, mediaTaskSnapshot, listMediaTasksByProject, listElevenLabsVoiceOptions } = ctx.media;
   const { readAppConfig, writeAppConfig } = ctx.appConfig;
   const { orbitService } = ctx.orbit;
+  const platform = ctx.platform;
   const { openBrowser, openNativeFolderDialog } = ctx.nativeDialogs;
   const { getProject } = ctx.projectStore;
   const { insertConversation, upsertMessage } = ctx.conversations;
@@ -357,7 +360,11 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
     }
     try {
       const config = await writeAppConfig(RUNTIME_DATA_DIR, req.body);
-      orbitService.configure(config.orbit);
+      orbitService.configure(
+        platform?.enabled
+          ? { ...(config.orbit ?? {}), enabled: false }
+          : config.orbit,
+      );
       res.json({ config });
     } catch (err: any) {
       res
@@ -436,6 +443,14 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
       return res.status(403).json({ error: 'cross-origin request rejected' });
     }
     try {
+      if (platform?.enabled) {
+        return res.status(409).json({
+          error: {
+            code: 'PLATFORM_FEATURE_UNAVAILABLE',
+            message: '云端平台模式暂不支持无用户上下文的 Orbit 自动运行，请在项目对话中使用当前账号的模型。',
+          },
+        });
+      }
       const locale = typeof req.body?.locale === 'string' ? req.body.locale : null;
       res.json(await orbitService.start('manual', { locale }));
     } catch (err: any) {

@@ -26,6 +26,8 @@ export type LocalDesignSystemImportOptions = {
   source?: DesignSystemProjectSource;
   importMode?: 'normalized' | 'hybrid' | 'verbatim';
   craftApplies?: string[];
+  /** Tenant marker used by hosted SubRouter mode. */
+  platformUserId?: string;
 };
 
 export type DesignSystemProjectSource =
@@ -185,6 +187,13 @@ export async function importLocalDesignSystemProject(
     )}\n`,
     'utf8',
   );
+  if (options.platformUserId) {
+    await writeFile(
+      path.join(outDir, 'metadata.json'),
+      `${JSON.stringify({ platformUserId: options.platformUserId }, null, 2)}\n`,
+      'utf8',
+    );
+  }
 
   const copiedAssets = await copyAssets(scan.assets, outDir);
   const copiedFonts = await copyFonts(scan.fonts, outDir);

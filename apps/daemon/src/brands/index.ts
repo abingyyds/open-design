@@ -142,6 +142,8 @@ export interface StartBrandExtractionOptions {
     agentId?: string | null;
     agentName?: string | null;
   };
+  /** Tenant marker used by hosted SubRouter mode for project isolation. */
+  platformUserId?: string | null;
 }
 
 export interface StartBrandExtractionResult {
@@ -245,6 +247,7 @@ export async function startBrandExtraction(
     skipDiscoveryBrief: true,
     brandId: id,
     brandSourceUrl: url,
+    ...(opts.platformUserId ? { platformUserId: opts.platformUserId } : {}),
   };
   const name = `${host} Design System`;
   const runProgrammatic = Boolean(opts.userDesignSystemsRoot);
@@ -370,6 +373,7 @@ export async function startBrandExtraction(
       imageryFallback,
       hasWebsiteSource,
       locale,
+      ...(opts.platformUserId ? { platformUserId: opts.platformUserId } : {}),
     };
     if (opts.dataDir) programmaticOptions.dataDir = opts.dataDir;
     if (opts.prefetch) programmaticOptions.prefetch = opts.prefetch;
@@ -768,6 +772,8 @@ export interface FinalizeBrandOptions {
   imageryFallback?: ImageryFallbackFn;
   /** Optional override; defaults to the locale stored in brand meta. */
   locale?: string;
+  /** Tenant marker used by hosted SubRouter mode. */
+  platformUserId?: string | null;
 }
 
 /**
@@ -920,6 +926,7 @@ async function finalizeBrandCore(opts: FinalizeBrandCoreOptions): Promise<BrandF
       ...(brand.description ? { companyBlurb: brand.description } : {}),
       sourceNotes: `Extracted from ${meta.sourceUrl}`,
     },
+    ...(opts.platformUserId ? { platformUserId: opts.platformUserId } : {}),
   });
   const designSystemId = summary.id;
   syncBrandSystemToUserDesignSystem(userDesignSystemsRoot, designSystemId, brandsRoot, id, body);
@@ -935,6 +942,7 @@ async function finalizeBrandCore(opts: FinalizeBrandCoreOptions): Promise<BrandF
     brandId: id,
     brandSourceUrl: meta.sourceUrl,
     brandDesignSystemId: designSystemId,
+    ...(opts.platformUserId ? { platformUserId: opts.platformUserId } : {}),
   };
   await syncBrandFilesToProject({
     brandsRoot,
@@ -1029,6 +1037,8 @@ export interface RunProgrammaticExtractionOptions {
   imageryFallback?: ImageryFallbackFn;
   locale?: string;
   abortSignal?: AbortSignal;
+  /** Tenant marker used by hosted SubRouter mode. */
+  platformUserId?: string | null;
 }
 
 /**

@@ -11,6 +11,7 @@ const SESSION_COOKIE = 'od_platform_session';
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const AUTO_KEY_PREFIX = 'open-design-auto';
 const CODEX_PLATFORM_PROVIDER_ID = 'open_design_platform';
+const UPSTREAM_TIMEOUT_MS = 15_000;
 
 export class PlatformError extends Error {
   status: number;
@@ -83,6 +84,7 @@ function unique(values: string[]): string[] {
 }
 
 function baseUrlCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
+  const railway = Boolean(env.RAILWAY_ENVIRONMENT || env.RAILWAY_PROJECT_ID);
   return unique([
     env.OD_SUBROUTER_BASE_URL,
     env.OPEN_DESIGN_SUBROUTER_BASE_URL,
@@ -93,8 +95,9 @@ function baseUrlCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
     ...parseCandidates(env.OD_SUBROUTER_BASE_URL_CANDIDATES),
     ...parseCandidates(env.SUBROUTER_BASE_URL_CANDIDATES),
     ...parseCandidates(env.MODEL_GATEWAY_BASE_URL_CANDIDATES),
-    DEFAULT_SUBROUTER_BASE_URL,
-    DEFAULT_PUBLIC_SUBROUTER_BASE_URL,
+    ...(railway
+      ? [DEFAULT_SUBROUTER_BASE_URL, DEFAULT_PUBLIC_SUBROUTER_BASE_URL]
+      : [DEFAULT_PUBLIC_SUBROUTER_BASE_URL, DEFAULT_SUBROUTER_BASE_URL]),
   ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0));
 }
 
@@ -104,8 +107,34 @@ function normalizeApiKey(key: unknown): string {
   return `sk-${text.replace(/^sk-/i, '')}`;
 }
 
+function normalizeAccessToken(token: unknown): string {
+  return String(token || '').trim().replace(/^Bearer\s+/i, '');
+}
+
 function bearer(apiKey: string): string {
   return `Bearer ${normalizeApiKey(apiKey).replace(/^Bearer\s+/i, '')}`;
+}
+
+async function fetchUpstream(input: string, init: RequestInit = {}): Promise<globalThis.Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: init.signal ?? controller.signal,
+      headers: {
+        Accept: 'application/json',
+        ...(init.headers ?? {}),
+      },
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new PlatformError('模型服务连接超时，请稍后重试', 504, 'UPSTREAM_TIMEOUT');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function extractItems(payload: unknown): unknown[] {
@@ -202,10 +231,39 @@ function extractKey(payload: unknown): { key: string; id: string } {
   };
 }
 
+function extractAccessToken(payload: unknown): string {
+  if (!payload || typeof payload !== 'object') return '';
+  const root = payload as Record<string, unknown>;
+  const data = root.data && typeof root.data === 'object' && !Array.isArray(root.data)
+    ? root.data as Record<string, unknown>
+    : root;
+  const user = data.user && typeof data.user === 'object' && !Array.isArray(data.user)
+    ? data.user as Record<string, unknown>
+    : root.user && typeof root.user === 'object' && !Array.isArray(root.user)
+      ? root.user as Record<string, unknown>
+      : {};
+  return normalizeAccessToken(
+    data.access_token ??
+      data.accessToken ??
+      data.token ??
+      user.access_token ??
+      user.accessToken ??
+      user.token ??
+      root.access_token ??
+      root.accessToken,
+  );
+}
+
 function findReusableKey(items: unknown[], exactName?: string): { key: string; id: string } | null {
   for (const item of items) {
     if (!item || typeof item !== 'object') continue;
     const record = item as Record<string, unknown>;
+    if (record.status !== undefined) {
+      const status = String(record.status).trim().toLowerCase();
+      if (record.status === false || ['0', 'disabled', 'revoked', 'expired', 'inactive'].includes(status)) {
+        continue;
+      }
+    }
     const name = String(record.name || '');
     if (exactName && name !== exactName) continue;
     if (!exactName && !name.startsWith(AUTO_KEY_PREFIX)) continue;
@@ -270,6 +328,10 @@ function pickDefaultModel(models: Array<{ id: string; type?: string }>): string 
   return candidates[0] ?? '';
 }
 
+function textModels(models: Array<{ id: string; type?: string }>) {
+  return models.filter((model) => model.type === 'text' && model.id);
+}
+
 function publicMessage(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error || '请求失败');
   return raw.replace(/subrouterai|subrouter/gi, '模型服务');
@@ -322,6 +384,19 @@ function buildCookie(headers: Headers): string {
     .join('; ');
 }
 
+function mergeCookieStrings(...values: string[]): string {
+  const cookies = new Map<string, string>();
+  for (const value of values) {
+    for (const part of String(value || '').split(';')) {
+      const index = part.indexOf('=');
+      if (index <= 0) continue;
+      const key = part.slice(0, index).trim();
+      if (key) cookies.set(key, part.slice(index + 1).trim());
+    }
+  }
+  return [...cookies.entries()].map(([key, value]) => `${key}=${value}`).join('; ');
+}
+
 function parseCookies(header: unknown): Record<string, string> {
   const out: Record<string, string> = {};
   if (typeof header !== 'string') return out;
@@ -330,7 +405,14 @@ function parseCookies(header: unknown): Record<string, string> {
     if (index < 0) continue;
     const key = part.slice(0, index).trim();
     const value = part.slice(index + 1).trim();
-    if (key) out[key] = decodeURIComponent(value);
+    if (!key) continue;
+    try {
+      out[key] = decodeURIComponent(value);
+    } catch {
+      // Ignore malformed percent escapes instead of turning an invalid client
+      // cookie into a daemon 500 response.
+      out[key] = value;
+    }
   }
   return out;
 }
@@ -363,8 +445,15 @@ function writeCodexPlatformConfig(home: string, baseUrl: string, model: string):
     `[model_providers.${CODEX_PLATFORM_PROVIDER_ID}]`,
     `name = ${tomlBasicString('Open Design Platform')}`,
     `base_url = ${tomlBasicString(baseUrl)}`,
+    // SubRouter credentials are injected into the child process environment.
+    // Codex only reads that environment key for configured providers when
+    // first-party OpenAI auth is disabled.  Leaving requires_openai_auth=true
+    // makes Codex look for an auth.json/ChatGPT login in the per-user home and
+    // silently ignores OPENAI_API_KEY, which is why a successful platform
+    // login could still produce an unauthenticated model run.
+    'env_key = "OPENAI_API_KEY"',
     'wire_api = "responses"',
-    'requires_openai_auth = true',
+    'requires_openai_auth = false',
     '',
   ];
   fs.writeFileSync(path.join(home, 'config.toml'), lines.join('\n'), 'utf8');
@@ -396,6 +485,7 @@ export class SubrouterPlatform {
         subrouter_base_url TEXT NOT NULL DEFAULT '${DEFAULT_SUBROUTER_BASE_URL}',
         subrouter_external_user_id TEXT NOT NULL DEFAULT '',
         subrouter_session_cookie TEXT NOT NULL DEFAULT '',
+        subrouter_access_token TEXT NOT NULL DEFAULT '',
         subrouter_api_key_id TEXT NOT NULL DEFAULT '',
         subrouter_distributor_id TEXT NOT NULL DEFAULT '',
         subrouter_distributor_slug TEXT NOT NULL DEFAULT '',
@@ -418,6 +508,11 @@ export class SubrouterPlatform {
         FOREIGN KEY(user_id) REFERENCES platform_users(id) ON DELETE CASCADE
       );
     `);
+    try {
+      this.db.exec("ALTER TABLE platform_users ADD COLUMN subrouter_access_token TEXT NOT NULL DEFAULT ''");
+    } catch {
+      // Existing databases already have the column.
+    }
   }
 
   health() {
@@ -438,28 +533,134 @@ export class SubrouterPlatform {
         return { sessionToken, ...account };
       } catch (error) {
         lastError = error;
+        // A 2FA response is tied to the credentials the user just supplied;
+        // trying another base URL would discard the pending verification
+        // session and eventually hide the actionable error behind a generic
+        // LOGIN_FAILED response.
+        if ((error as any)?.code === 'TWO_FACTOR_REQUIRED') {
+          throw error;
+        }
+      }
+    }
+    if ((lastError as any)?.code === 'TWO_FACTOR_REQUIRED') {
+      throw lastError;
+    }
+    throw new PlatformError(publicMessage(lastError), 401, 'LOGIN_FAILED');
+  }
+
+  async loginWithTwoFactor(username: string, password: string, code: string) {
+    const cleanUsername = String(username || '').trim();
+    const cleanPassword = String(password || '').trim();
+    const cleanCode = String(code || '').trim();
+    if (!cleanUsername || !cleanPassword) throw new PlatformError('用户名和密码不能为空');
+    if (!cleanCode) throw new PlatformError('请输入双重验证码', 400, 'TWO_FACTOR_CODE_REQUIRED');
+    let lastError: unknown = new PlatformError('登录失败');
+    for (const baseUrl of baseUrlCandidates()) {
+      try {
+        const login = await this.loginSubrouter(baseUrl, cleanUsername, cleanPassword, cleanCode);
+        const account = await this.prepareAccount(login, cleanUsername);
+        const sessionToken = this.createSession(account.user.id);
+        return { sessionToken, ...account };
+      } catch (error) {
+        lastError = error;
+        if (String((error as any)?.code || '').startsWith('TWO_FACTOR_')) {
+          throw error;
+        }
       }
     }
     throw new PlatformError(publicMessage(lastError), 401, 'LOGIN_FAILED');
   }
 
-  async loginSubrouter(baseUrl: string, username: string, password: string) {
+  async loginSubrouter(baseUrl: string, username: string, password: string, twoFactorCode?: string) {
     const root = normalizeBaseUrl(baseUrl);
-    const response = await fetch(`${root}/api/user/login`, {
+    const response = await fetchUpstream(`${root}/api/user/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
       redirect: 'manual',
     });
-    const payload = await parseResponse(response, '用户名或密码错误');
-    const cookie = buildCookie(response.headers);
-    if (!cookie) throw new PlatformError('登录成功但未返回会话信息');
+    let payload = await parseResponse(response, '用户名或密码错误');
+    const initialUser = extractUser(payload);
+    const initialAccessToken = extractAccessToken(payload);
+    const loginData = payload && typeof payload === 'object'
+      ? (payload as Record<string, unknown>).data
+      : null;
+    const loginRoot = payload && typeof payload === 'object'
+      ? payload as Record<string, unknown>
+      : {};
+    const initialCookie = buildCookie(response.headers);
+    let finalCookie = initialCookie;
+    if (
+      (loginData && typeof loginData === 'object' && !Array.isArray(loginData))
+      || loginRoot.require_2fa === true
+      || loginRoot.require2fa === true
+    ) {
+      const loginRecord = loginData && typeof loginData === 'object' && !Array.isArray(loginData)
+        ? loginData as Record<string, unknown>
+        : {};
+      const requiresTwoFactor = loginRecord.require_2fa
+        ?? loginRecord.require2fa
+        ?? loginRoot.require_2fa
+        ?? loginRoot.require2fa;
+      if (requiresTwoFactor === true) {
+        if (!twoFactorCode) {
+          throw new PlatformError('该 SubRouter 账号启用了双重验证，请输入验证码后继续', 401, 'TWO_FACTOR_REQUIRED');
+        }
+        if (!initialCookie) {
+          throw new PlatformError('双重验证会话已失效，请重新登录', 401, 'TWO_FACTOR_SESSION_EXPIRED');
+        }
+        let verificationPayload: unknown;
+        try {
+          const verificationResponse = await fetchUpstream(`${root}/api/user/login/2fa`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Cookie: initialCookie,
+            },
+            body: JSON.stringify({ code: twoFactorCode }),
+          });
+          verificationPayload = await parseResponse(verificationResponse, '双重验证码错误');
+          const verificationCookie = buildCookie(verificationResponse.headers);
+          if (verificationCookie) finalCookie = mergeCookieStrings(initialCookie, verificationCookie);
+        } catch (error) {
+          throw new PlatformError(
+            publicMessage(error) || '双重验证码错误',
+            401,
+            'TWO_FACTOR_INVALID',
+          );
+        }
+        const verifiedUser = extractUser(verificationPayload);
+        payload = {
+          ...(verificationPayload && typeof verificationPayload === 'object'
+            ? verificationPayload as Record<string, unknown>
+            : {}),
+          ...(Object.keys(verifiedUser).length > 0
+            ? { user: verifiedUser }
+            : initialUser
+              ? { user: initialUser }
+              : {}),
+          ...(initialAccessToken ? { access_token: initialAccessToken } : {}),
+        };
+      }
+    }
+    const cookie = finalCookie || buildCookie(response.headers);
+    const accessToken = extractAccessToken(payload);
+    if (!cookie && !accessToken) throw new PlatformError('登录成功但未返回会话信息');
     const user = extractUser(payload);
     const externalUserId = String(user.id || '').trim();
-    const headers = this.subrouterHeaders({ session_cookie: cookie, external_user_id: externalUserId });
+    const headers = this.subrouterHeaders({
+      session_cookie: cookie,
+      access_token: accessToken,
+      external_user_id: externalUserId,
+    });
     let distributor = extractDistributor(payload);
-    if (!distributor) {
-      distributor = await this.fetchSelfDistributor(root, headers);
+    // The login payload on current SubRouter builds identifies a distributor
+    // by id/slug but omits its public domain.  The distributor model catalogue
+    // is host-routed, so enrich that partial record from the self endpoint
+    // before attempting token/model operations.
+    if (!distributor || !distributor.domain) {
+      const resolvedDistributor = await this.fetchSelfDistributor(root, headers);
+      if (resolvedDistributor) distributor = resolvedDistributor;
     }
     return {
       base_url: root,
@@ -468,6 +669,7 @@ export class SubrouterPlatform {
       email: String(user.email || ''),
       display_name: String(user.display_name || user.displayName || user.username || username),
       session_cookie: cookie,
+      access_token: accessToken,
       distributor,
     };
   }
@@ -476,13 +678,18 @@ export class SubrouterPlatform {
     const seed = String(login.external_user_id || login.email || login.username || fallbackUsername);
     const userId = `sr_${sha256(`subrouterai:${seed}`).slice(0, 24)}`;
     const key = await this.ensureSubrouterKey(login);
-    const models = await this.fetchModelsForLogin(login, key.key);
+    // Codex is the platform runtime.  Keep image/video catalogue entries out
+    // of the account picker so a user cannot select a media-only model and
+    // then receive an opaque Codex failure on the first run.
+    const models = textModels(await this.fetchModelsForLogin(login, key.key));
     const existing = this.rowForUser(userId);
     const modelIds = new Set(models.map((model) => model.id));
     const defaultModel =
-      existing?.default_model && modelIds.has(existing.default_model)
-        ? existing.default_model
-        : pickDefaultModel(models);
+      modelIds.size === 0
+        ? String(existing?.default_model || '')
+        : existing?.default_model && modelIds.has(existing.default_model)
+          ? existing.default_model
+          : pickDefaultModel(models);
     const dist = login.distributor && typeof login.distributor === 'object'
       ? login.distributor as Record<string, string>
       : {};
@@ -500,6 +707,7 @@ export class SubrouterPlatform {
       subrouter_base_url: normalizeBaseUrl(String(login.base_url || '')),
       subrouter_external_user_id: String(login.external_user_id || ''),
       subrouter_session_cookie: String(login.session_cookie || ''),
+      subrouter_access_token: normalizeAccessToken(login.access_token),
       subrouter_api_key_id: key.id || '',
       subrouter_distributor_id: dist.id || '',
       subrouter_distributor_slug: dist.slug || '',
@@ -518,6 +726,7 @@ export class SubrouterPlatform {
                subrouter_base_url = @subrouter_base_url,
                subrouter_external_user_id = @subrouter_external_user_id,
                subrouter_session_cookie = @subrouter_session_cookie,
+               subrouter_access_token = @subrouter_access_token,
                subrouter_api_key_id = @subrouter_api_key_id,
                subrouter_distributor_id = @subrouter_distributor_id,
                subrouter_distributor_slug = @subrouter_distributor_slug,
@@ -531,12 +740,12 @@ export class SubrouterPlatform {
       this.db.prepare(`
         INSERT INTO platform_users (
           id, username, email, display_name, subrouter_api_key, subrouter_base_url,
-          subrouter_external_user_id, subrouter_session_cookie, subrouter_api_key_id,
+          subrouter_external_user_id, subrouter_session_cookie, subrouter_access_token, subrouter_api_key_id,
           subrouter_distributor_id, subrouter_distributor_slug, subrouter_distributor_name,
           subrouter_distributor_domain, default_model, created_at, updated_at
         ) VALUES (
           @id, @username, @email, @display_name, @subrouter_api_key, @subrouter_base_url,
-          @subrouter_external_user_id, @subrouter_session_cookie, @subrouter_api_key_id,
+          @subrouter_external_user_id, @subrouter_session_cookie, @subrouter_access_token, @subrouter_api_key_id,
           @subrouter_distributor_id, @subrouter_distributor_slug, @subrouter_distributor_name,
           @subrouter_distributor_domain, @default_model, @created_at, @updated_at
         )
@@ -559,9 +768,15 @@ export class SubrouterPlatform {
     return this.db.prepare('SELECT * FROM platform_users WHERE id = ?').get(userId) ?? null;
   }
 
-  subrouterHeaders(input: { session_cookie?: string; external_user_id?: string }) {
+  subrouterHeaders(input: {
+    session_cookie?: string;
+    access_token?: string;
+    external_user_id?: string;
+  }) {
     const headers: Record<string, string> = {};
     if (input.session_cookie) headers.Cookie = input.session_cookie;
+    const accessToken = normalizeAccessToken(input.access_token);
+    if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
     if (input.external_user_id) headers['New-Api-User'] = input.external_user_id;
     return headers;
   }
@@ -569,6 +784,7 @@ export class SubrouterPlatform {
   headersFromRow(row: any): Record<string, string> {
     return this.subrouterHeaders({
       session_cookie: row?.subrouter_session_cookie || '',
+      access_token: row?.subrouter_access_token || '',
       external_user_id: row?.subrouter_external_user_id || '',
     });
   }
@@ -576,6 +792,7 @@ export class SubrouterPlatform {
   distributorHeadersFromLogin(login: any): Record<string, string> {
     const headers = this.subrouterHeaders({
       session_cookie: login.session_cookie,
+      access_token: login.access_token,
       external_user_id: login.external_user_id,
     });
     const distributor = login.distributor || {};
@@ -592,22 +809,25 @@ export class SubrouterPlatform {
   }
 
   async fetchSelfDistributor(baseUrl: string, headers: Record<string, string>) {
-    const response = await fetch(`${normalizeBaseUrl(baseUrl)}/api/user/self/distributor`, { headers });
+    const response = await fetchUpstream(`${normalizeBaseUrl(baseUrl)}/api/user/self/distributor`, { headers });
     if (response.status === 404) return null;
     const payload = await parseResponse(response, '读取分站信息失败');
     return extractDistributor(payload);
   }
 
   async listSubrouterKeys(login: any): Promise<unknown[]> {
-    const headers = this.subrouterHeaders({
-      session_cookie: login.session_cookie,
-      external_user_id: login.external_user_id,
-    });
+    const headers = login.distributor
+      ? this.distributorHeadersFromLogin(login)
+      : this.subrouterHeaders({
+          session_cookie: login.session_cookie,
+          access_token: login.access_token,
+          external_user_id: login.external_user_id,
+        });
     const root = normalizeBaseUrl(login.base_url);
     const url = login.distributor
       ? `${root}/api/user/self/distributor/token/list?page=1&page_size=100`
-      : `${root}/api/token/`;
-    const payload = await parseResponse(await fetch(url, { headers }), '获取访问密钥列表失败');
+      : `${root}/api/token/?p=1&size=100`;
+    const payload = await parseResponse(await fetchUpstream(url, { headers }), '获取访问密钥列表失败');
     return extractItems(payload);
   }
 
@@ -616,10 +836,13 @@ export class SubrouterPlatform {
     if (existing) return existing;
     const root = normalizeBaseUrl(login.base_url);
     const headers = {
-      ...this.subrouterHeaders({
-        session_cookie: login.session_cookie,
-        external_user_id: login.external_user_id,
-      }),
+      ...(login.distributor
+        ? this.distributorHeadersFromLogin(login)
+        : this.subrouterHeaders({
+            session_cookie: login.session_cookie,
+            access_token: login.access_token,
+            external_user_id: login.external_user_id,
+          })),
       'Content-Type': 'application/json',
     };
     const name = `${AUTO_KEY_PREFIX}-${Date.now()}`;
@@ -635,7 +858,7 @@ export class SubrouterPlatform {
           model_limits_enabled: false,
         };
     const payload = await parseResponse(
-      await fetch(`${root}${pathName}`, {
+      await fetchUpstream(`${root}${pathName}`, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
@@ -651,7 +874,7 @@ export class SubrouterPlatform {
 
   async fetchGatewayModels(baseUrl: string, apiKey: string) {
     if (!apiKey) return [];
-    const response = await fetch(`${gatewayBaseUrl(baseUrl)}/models`, {
+    const response = await fetchUpstream(`${gatewayBaseUrl(baseUrl)}/models`, {
       headers: { Authorization: bearer(apiKey) },
     });
     const payload = await parseResponse(response, '读取模型列表失败');
@@ -660,20 +883,34 @@ export class SubrouterPlatform {
 
   async fetchSubscribedModels(rowOrLogin: any) {
     const baseUrl = rowOrLogin.subrouter_base_url || rowOrLogin.base_url;
-    const response = await fetch(`${normalizeBaseUrl(baseUrl)}/api/user/self/subrouter/models`, {
-      headers: rowOrLogin.subrouter_session_cookie ? this.headersFromRow(rowOrLogin) : this.subrouterHeaders({
-        session_cookie: rowOrLogin.session_cookie,
-        external_user_id: rowOrLogin.external_user_id,
-      }),
-    });
-    if (response.status === 404) return [];
-    const payload = await parseResponse(response, '读取订阅模型失败');
-    return normalizeModels(extractItems(payload));
+    const headers =
+      rowOrLogin.subrouter_session_cookie || rowOrLogin.subrouter_access_token
+        ? this.headersFromRow(rowOrLogin)
+        : this.subrouterHeaders({
+            session_cookie: rowOrLogin.session_cookie,
+            access_token: rowOrLogin.access_token,
+            external_user_id: rowOrLogin.external_user_id,
+          });
+    // Current SubRouter exposes the same catalogue used by its console at
+    // `/api/user/models?group=subrouter`. Keep the older self/subrouter path
+    // as a compatibility fallback for deployed forks.
+    const endpoints = [
+      `${normalizeBaseUrl(baseUrl)}/api/user/models?group=subrouter`,
+      `${normalizeBaseUrl(baseUrl)}/api/user/self/subrouter/models`,
+    ];
+    for (const endpoint of endpoints) {
+      const response = await fetchUpstream(endpoint, { headers });
+      if (response.status === 404) continue;
+      const payload = await parseResponse(response, '读取订阅模型失败');
+      const models = normalizeModels(extractItems(payload));
+      if (models.length > 0) return models;
+    }
+    return [];
   }
 
   async fetchDistributorSiteModels(baseUrl: string, headers: Record<string, string>) {
     if (!headers.Host) return [];
-    const response = await fetch(`${normalizeBaseUrl(baseUrl)}/api/dist/site/models`, { headers });
+    const response = await fetchUpstream(`${normalizeBaseUrl(baseUrl)}/api/dist/site/models`, { headers });
     if (response.status === 404) return [];
     const payload = await parseResponse(response, '读取分站模型失败');
     return normalizeModels(extractItems(payload));
@@ -708,13 +945,16 @@ export class SubrouterPlatform {
       models = await this.fetchSubscribedModels(row).catch(() => []);
     }
     if (models.length === 0) {
-      models = await this.fetchGatewayModels(row.subrouter_base_url, apiKey);
+      models = await this.fetchGatewayModels(row.subrouter_base_url, apiKey).catch(() => []);
     }
+    models = textModels(models);
     const modelIds = new Set(models.map((model) => model.id));
-    let defaultModel = row.default_model && modelIds.has(row.default_model)
-      ? row.default_model
-      : pickDefaultModel(models);
-    if (defaultModel !== row.default_model) {
+    let defaultModel = models.length === 0
+      ? String(row.default_model || '')
+      : row.default_model && modelIds.has(row.default_model)
+        ? row.default_model
+        : pickDefaultModel(models);
+    if (models.length > 0 && defaultModel !== row.default_model) {
       this.setDefaultModel(userId, defaultModel);
     }
     return { models, defaultModel };
@@ -735,6 +975,9 @@ export class SubrouterPlatform {
     const baseUrl = gatewayBaseUrl(row.subrouter_base_url);
     const home = path.join(userDataDir(this.dataDir, userId), 'codex-home');
     const model = String(row.default_model || '');
+    if (!model) {
+      throw new PlatformError('当前账号没有可用的文本模型，请检查订阅或联系管理员', 503, 'NO_MODELS_AVAILABLE');
+    }
     fs.mkdirSync(home, { recursive: true });
     writeCodexPlatformConfig(home, baseUrl, model);
     return {
@@ -799,8 +1042,11 @@ export class SubrouterPlatform {
          AND s.expires_at > ?
     `).get(sha256(token), now());
     if (!row) return null;
-    this.db.prepare('UPDATE platform_sessions SET last_seen_at = ? WHERE token_hash = ?')
-      .run(now(), sha256(token));
+    const timestamp = now();
+    // Sliding expiry keeps an actively used cloud session alive while still
+    // bounding abandoned sessions to SESSION_TTL_MS.
+    this.db.prepare('UPDATE platform_sessions SET last_seen_at = ?, expires_at = ? WHERE token_hash = ?')
+      .run(timestamp, timestamp + SESSION_TTL_MS, sha256(token));
     return this.publicUser(row);
   }
 
@@ -895,7 +1141,14 @@ export function registerSubrouterPlatformRoutes(app: Express, platform: Subroute
   app.post('/api/platform/login', async (req, res) => {
     try {
       const { username, password } = req.body || {};
-      const result = await platform.login(username, password);
+      const twoFactorCode = typeof req.body?.twoFactorCode === 'string'
+        ? req.body.twoFactorCode
+        : typeof req.body?.code === 'string'
+          ? req.body.code
+          : '';
+      const result = twoFactorCode.trim()
+        ? await platform.loginWithTwoFactor(username, password, twoFactorCode)
+        : await platform.login(username, password);
       res.cookie(SESSION_COOKIE, result.sessionToken, {
         httpOnly: true,
         sameSite: 'lax',
@@ -943,6 +1196,13 @@ export function registerSubrouterPlatformRoutes(app: Express, platform: Subroute
       }
       const model = String(req.body?.model || '').trim();
       if (!model) throw new PlatformError('请选择模型');
+      const available = await platform.fetchModels(user.id);
+      if (available.models.length === 0) {
+        throw new PlatformError('暂时无法读取可用模型，请稍后刷新重试', 503, 'MODELS_UNAVAILABLE');
+      }
+      if (!available.models.some((candidate) => candidate.id === model)) {
+        throw new PlatformError('所选模型当前不可用，请刷新模型列表后重试', 409, 'MODEL_UNAVAILABLE');
+      }
       platform.setDefaultModel(user.id, model);
       res.json({ ok: true, defaultModel: model });
     } catch (error) {

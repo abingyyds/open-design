@@ -45,6 +45,8 @@ export type DesignSystemSummary = {
   updatedAt?: string;
   provenance?: DesignSystemProvenance;
   projectId?: string;
+  /** Tenant marker used by hosted SubRouter mode. */
+  platformUserId?: string;
 };
 
 export type DesignSystemFileKind =
@@ -198,6 +200,7 @@ type UserDesignSystemMetadata = {
   updatedAt?: string;
   provenance?: DesignSystemProvenance;
   projectId?: string;
+  platformUserId?: string;
 };
 
 type AtomicTextFileWrite = {
@@ -247,6 +250,8 @@ export type UserDesignSystemInput = {
   body?: string;
   sourceNotes?: string;
   provenance?: DesignSystemProvenance;
+  /** Tenant marker used by hosted SubRouter mode. */
+  platformUserId?: string | null;
 };
 
 export type UserDesignSystemRevisionInput = {
@@ -329,6 +334,7 @@ export async function listDesignSystems(
         ...(metadata.updatedAt ? { updatedAt: metadata.updatedAt } : {}),
         ...(metadata.provenance ? { provenance: metadata.provenance } : {}),
         ...(metadata.projectId ? { projectId: metadata.projectId } : {}),
+        ...(metadata.platformUserId ? { platformUserId: metadata.platformUserId } : {}),
       });
     } catch {
       // Skip.
@@ -1143,6 +1149,7 @@ export async function createUserDesignSystem(
     createdAt: now,
     updatedAt: now,
     ...(provenance ? { provenance } : {}),
+    ...(input.platformUserId ? { platformUserId: input.platformUserId } : {}),
   });
   if (artifactMode !== 'agent-managed') {
     await writeGeneratedDesignSystemFiles(root, dirId, {
@@ -1203,6 +1210,11 @@ export async function updateUserDesignSystem(
     createdAt: existingMeta.createdAt ?? now,
     updatedAt: now,
     ...(provenance ? { provenance } : {}),
+    ...(input.platformUserId
+      ? { platformUserId: input.platformUserId }
+      : existingMeta.platformUserId
+        ? { platformUserId: existingMeta.platformUserId }
+        : {}),
   });
   const sourceNotes = provenanceToNotes(provenance) || cleanMultiline(input.sourceNotes);
   if (artifactMode !== 'agent-managed') {
@@ -2410,6 +2422,9 @@ async function readUserMetadata(root: string, id: string): Promise<UserDesignSys
       ...(typeof parsed.updatedAt === 'string' ? { updatedAt: parsed.updatedAt } : {}),
       ...(provenance ? { provenance } : {}),
       ...(projectId ? { projectId } : {}),
+      ...(typeof parsed.platformUserId === 'string' && parsed.platformUserId.trim()
+        ? { platformUserId: parsed.platformUserId.trim() }
+        : {}),
     };
   } catch {
     return {};

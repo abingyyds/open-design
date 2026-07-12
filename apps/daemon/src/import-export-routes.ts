@@ -13,7 +13,9 @@ import { authorizeReasoningEgress, sendReasoningEgressDenial } from './reasoning
 import { sandboxImportedProjectRootUnavailableReason } from './sandbox-mode.js';
 import { parseOrchestratorWorkspace } from './workspace-contract.js';
 
-export interface RegisterImportRoutesDeps extends RouteDeps<'db' | 'http' | 'uploads' | 'node' | 'ids' | 'paths' | 'imports' | 'auth' | 'projectStore' | 'conversations' | 'projectFiles' | 'validation'> {}
+export interface RegisterImportRoutesDeps extends RouteDeps<'db' | 'http' | 'uploads' | 'node' | 'ids' | 'paths' | 'imports' | 'auth' | 'projectStore' | 'conversations' | 'projectFiles' | 'validation'> {
+  platform?: { enabled?: boolean; currentUser?: (req: unknown) => { id?: string } | null };
+}
 
 export function registerImportRoutes(app: Express, ctx: RegisterImportRoutesDeps) {
   const { db } = ctx;
@@ -34,6 +36,12 @@ export function registerImportRoutes(app: Express, ctx: RegisterImportRoutesDeps
   const { insertConversation } = ctx.conversations;
   const { setTabs } = ctx.projectFiles;
   const { validateProjectDesignSystemId } = ctx.validation;
+  const platform = ctx.platform;
+  const platformUserIdForRequest = (req: unknown): string | undefined => {
+    if (!platform?.enabled) return undefined;
+    const user = platform.currentUser?.(req);
+    return user?.id ? String(user.id) : undefined;
+  };
   app.post(
     '/api/import/claude-design',
     importUpload.single('file'),
@@ -56,6 +64,7 @@ export function registerImportRoutes(app: Express, ctx: RegisterImportRoutesDeps
           projectDir(PROJECTS_DIR, id),
         );
         fs.promises.unlink(req.file.path).catch(() => {});
+        const platformUserId = platformUserIdForRequest(req);
 
         const project = insertProject(db, {
           id,
@@ -68,6 +77,7 @@ export function registerImportRoutes(app: Express, ctx: RegisterImportRoutesDeps
             importedFrom: 'claude-design',
             entryFile: imported.entryFile,
             sourceFileName: originalName,
+            ...(platformUserId ? { platformUserId } : {}),
           },
           createdAt: now,
           updatedAt: now,
@@ -339,7 +349,11 @@ export function registerImportRoutes(app: Express, ctx: RegisterImportRoutesDeps
           ? name.trim()
           : path.basename(normalizedPath);
       const entryFile = await detectEntryFile(normalizedPath);
-      const designSystemValidation = await validateProjectDesignSystemId(designSystemId);
+      const platformUserId = platformUserIdForRequest(req);
+      const designSystemValidation = await validateProjectDesignSystemId(
+        designSystemId,
+        { platformUserId: platformUserId ?? null },
+      );
       if (!designSystemValidation.ok) {
         return sendApiError(
           res,
@@ -359,6 +373,7 @@ export function registerImportRoutes(app: Express, ctx: RegisterImportRoutesDeps
           baseDir: normalizedPath,
           importedFrom: 'folder',
           entryFile,
+          ...(platformUserId ? { platformUserId } : {}),
           ...(normalizedOrchestratorWorkspace
             ? { orchestratorWorkspace: normalizedOrchestratorWorkspace }
             : {}),
