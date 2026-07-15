@@ -114,6 +114,7 @@ ENV OD_DISABLE_API_AUTH=1
 ENV OD_CODEX_SANDBOX=danger-full-access
 ENV SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
 ENV OD_SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
+ENV OD_SUBROUTER_GATEWAY_BASE_URL=https://api.subrouter.com
 
 EXPOSE 7456
 

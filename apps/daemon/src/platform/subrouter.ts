@@ -58,8 +58,29 @@ function normalizeBaseUrl(value: string | undefined | null): string {
   return raw;
 }
 
-function gatewayBaseUrl(baseUrl: string): string {
-  const normalized = normalizeBaseUrl(baseUrl);
+function gatewayBaseUrl(baseUrl: string, env: NodeJS.ProcessEnv = process.env): string {
+  const managementBaseUrl = normalizeBaseUrl(baseUrl);
+  const configuredGateway =
+    env.OD_SUBROUTER_GATEWAY_BASE_URL ||
+    env.OPEN_DESIGN_SUBROUTER_GATEWAY_BASE_URL ||
+    env.SUBROUTER_GATEWAY_BASE_URL ||
+    env.MODEL_GATEWAY_BASE_URL;
+  // Railway's private SubRouter service is the preferred low-latency origin
+  // for login, token management, and account APIs. Its current deployment does
+  // not expose the Responses endpoint Codex requires, while the public gateway
+  // does. Keep those two traffic classes separate instead of pointing Codex at
+  // the private management origin and receiving /v1/responses 404s.
+  const normalized = configuredGateway
+    ? normalizeBaseUrl(configuredGateway)
+    : (() => {
+        try {
+          return new URL(managementBaseUrl).hostname.endsWith('.railway.internal')
+            ? DEFAULT_PUBLIC_SUBROUTER_BASE_URL
+            : managementBaseUrl;
+        } catch {
+          return managementBaseUrl;
+        }
+      })();
   return normalized.endsWith('/v1') ? normalized : `${normalized}/v1`;
 }
 
@@ -463,10 +484,12 @@ export class SubrouterPlatform {
   enabled: boolean;
   dataDir: string;
   db: Database.Database;
+  env: NodeJS.ProcessEnv;
 
   constructor(dataDir: string, env: NodeJS.ProcessEnv = process.env) {
     this.enabled = subrouterPlatformEnabled(env);
     this.dataDir = dataDir;
+    this.env = env;
     fs.mkdirSync(dataDir, { recursive: true });
     this.db = new Database(path.join(dataDir, 'platform.sqlite3'));
     this.db.pragma('journal_mode = WAL');
@@ -874,7 +897,7 @@ export class SubrouterPlatform {
 
   async fetchGatewayModels(baseUrl: string, apiKey: string) {
     if (!apiKey) return [];
-    const response = await fetchUpstream(`${gatewayBaseUrl(baseUrl)}/models`, {
+    const response = await fetchUpstream(`${gatewayBaseUrl(baseUrl, this.env)}/models`, {
       headers: { Authorization: bearer(apiKey) },
     });
     const payload = await parseResponse(response, '读取模型列表失败');
@@ -972,7 +995,7 @@ export class SubrouterPlatform {
     if (!row) throw new PlatformError('登录已过期，请重新登录', 401, 'SESSION_EXPIRED');
     const apiKey = normalizeApiKey(row.subrouter_api_key);
     if (!apiKey) throw new PlatformError('当前账号未准备好模型调用密钥，请重新登录');
-    const baseUrl = gatewayBaseUrl(row.subrouter_base_url);
+    const baseUrl = gatewayBaseUrl(row.subrouter_base_url, this.env);
     const home = path.join(userDataDir(this.dataDir, userId), 'codex-home');
     const model = String(row.default_model || '');
     if (!model) {

@@ -13,7 +13,12 @@ OD_DISABLE_API_AUTH=1
 OD_CODEX_SANDBOX=danger-full-access
 SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
 OD_SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
+OD_SUBROUTER_GATEWAY_BASE_URL=https://api.subrouter.com
 ```
+
+The private Railway URL is used for login and account management. Codex model
+traffic must use the public gateway because Codex requires `/v1/responses`,
+which is not exposed by the current private SubRouter service.
 
 Railway provides `PORT` automatically. Do not set `OD_PORT` unless you have a
 specific reason to override local runs.

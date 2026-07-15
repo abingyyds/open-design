@@ -75,6 +75,28 @@ describe('SubrouterPlatform Codex runtime', () => {
     expect(config).not.toContain('claude-sonnet-4-20250514');
   });
 
+  it('keeps Railway account APIs private but sends Codex Responses traffic to the public gateway', () => {
+    const service = createPlatformUser();
+    service.db.prepare('UPDATE platform_users SET subrouter_base_url = ? WHERE id = ?')
+      .run('http://subrouter.railway.internal:8080', 'sr_platform_user');
+
+    const runtime = service.runtimeForUser('sr_platform_user');
+
+    expect(runtime.baseUrl).toBe('https://api.subrouter.com/v1');
+    expect(runtime.agentEnv.OPENAI_BASE_URL).toBe('https://api.subrouter.com/v1');
+    const config = readFileSync(join(runtime.agentEnv.CODEX_HOME, 'config.toml'), 'utf8');
+    expect(config).toContain('base_url = "https://api.subrouter.com/v1"');
+  });
+
+  it('allows deployments to override the dedicated SubRouter model gateway', () => {
+    const service = createPlatformUser();
+    service.env.OD_SUBROUTER_GATEWAY_BASE_URL = 'https://gateway.example.com/v1';
+    service.db.prepare('UPDATE platform_users SET subrouter_base_url = ? WHERE id = ?')
+      .run('http://subrouter.railway.internal:8080', 'sr_platform_user');
+
+    expect(service.runtimeForUser('sr_platform_user').baseUrl).toBe('https://gateway.example.com/v1');
+  });
+
   it('accepts SubRouter JSON access tokens when login does not set a cookie', async () => {
     const service = createPlatformUser();
     const fetchMock = vi.spyOn(globalThis, 'fetch')
