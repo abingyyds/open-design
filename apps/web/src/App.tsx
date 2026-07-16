@@ -408,6 +408,26 @@ function AppInner() {
   const platformReadyForApp =
     platformState.loaded && (!platformState.enabled || platformState.authenticated);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const platformAwareAgents = useMemo(() => {
+    if (!platformState.enabled || !platformState.authenticated) return agents;
+    const models = platformState.models.map((model) => ({
+      id: model.id,
+      label: platformModelLabel(model),
+    }));
+    return agents.map((agent) =>
+      agent.id === PLATFORM_AGENT_ID
+        ? {
+            ...agent,
+            // The platform account is the source of truth for Codex models in
+            // hosted mode. Do not show the local CLI catalogue here: those
+            // models may use a different account or a different wire API.
+            models,
+            modelsSource: 'live' as const,
+            supportsCustomModel: false,
+          }
+        : agent,
+    );
+  }, [agents, platformState.authenticated, platformState.enabled, platformState.models]);
   const amrModelsRef = useRef<AmrModelsResponse | null>(null);
   const amrPollGenerationRef = useRef(0);
   const agentStreamRequestSeqRef = useRef(0);
@@ -1230,6 +1250,46 @@ function AppInner() {
     return result.providers;
   }, []);
 
+  const persistPlatformModelSelection = useCallback(async (model: string): Promise<string> => {
+    const clean = model.trim();
+    const snapshot = platformStateRef.current;
+    if (
+      !clean ||
+      !snapshot.enabled ||
+      !snapshot.authenticated ||
+      clean === snapshot.defaultModel
+    ) {
+      return clean;
+    }
+    setPlatformState((current) => ({ ...current, savingModel: true, error: null }));
+    try {
+      const result = await setPlatformModel(clean);
+      const nextModel = result.defaultModel || clean;
+      setPlatformState((current) => ({
+        ...current,
+        defaultModel: nextModel,
+        user: current.user
+          ? {
+              ...current.user,
+              account: current.user.account
+                ? { ...current.user.account, defaultModel: nextModel }
+                : current.user.account,
+            }
+          : current.user,
+        savingModel: false,
+      }));
+      applyPlatformRuntimeConfig(nextModel);
+      return nextModel;
+    } catch (err) {
+      setPlatformState((current) => ({
+        ...current,
+        savingModel: false,
+        error: err instanceof Error ? err.message : '模型保存失败',
+      }));
+      throw err;
+    }
+  }, [applyPlatformRuntimeConfig]);
+
   /**
    * Autosave-driven persistence path. The settings dialog calls this on
    * every committed edit (via a debounced effect) so localStorage and
@@ -1248,6 +1308,11 @@ function AppInner() {
     // closing, preserve any onboarding completion that the close gesture
     // already committed so an unmount autosave cannot re-open the welcome flow.
     const persisted = buildPersistedConfig(next, configRef.current);
+    const previousPlatformModel = configRef.current.agentModels?.[PLATFORM_AGENT_ID]?.model?.trim() ?? '';
+    const nextPlatformModel = persisted.agentModels?.[PLATFORM_AGENT_ID]?.model?.trim() ?? '';
+    if (nextPlatformModel && nextPlatformModel !== previousPlatformModel) {
+      await persistPlatformModelSelection(nextPlatformModel);
+    }
     latestPersistedConfigRef.current = persisted;
     saveConfig(persisted);
     setConfig(persisted);
@@ -1266,7 +1331,7 @@ function AppInner() {
         : Promise.resolve(),
       syncConfigToDaemon(persisted, { throwOnError: true }),
     ]);
-  }, [daemonMediaProviders, daemonMediaProvidersFetchState]);
+  }, [daemonMediaProviders, daemonMediaProvidersFetchState, persistPlatformModelSelection]);
 
   /**
    * Explicit Composio API-key save. Called from the section-local
@@ -1334,6 +1399,15 @@ function AppInner() {
 
   const handleAgentModelChange = useCallback(
     (agentId: string, choice: { model?: string; reasoning?: string }) => {
+      if (
+        agentId === PLATFORM_AGENT_ID &&
+        typeof choice.model === 'string' &&
+        platformStateRef.current.enabled &&
+        platformStateRef.current.authenticated
+      ) {
+        void persistPlatformModelSelection(choice.model).catch(() => {});
+        return;
+      }
       const current = latestPersistedConfigRef.current;
       const prev = current.agentModels?.[agentId] ?? {};
       const merged = { ...prev, ...choice };
@@ -1347,7 +1421,7 @@ function AppInner() {
       void syncConfigToDaemon(next);
       setConfig(next);
     },
-    [],
+    [persistPlatformModelSelection],
   );
 
   // BYOK protocol switch — also flips `mode` to 'api' so the user does
@@ -1472,26 +1546,15 @@ function AppInner() {
   const handlePlatformModelChange = useCallback(
     async (model: string) => {
       if (!model || model === platformStateRef.current.defaultModel) return;
-      setPlatformState((current) => ({ ...current, savingModel: true, error: null }));
       try {
-        const result = await setPlatformModel(model);
-        const nextModel = result.defaultModel || model;
-        setPlatformState((current) => ({
-          ...current,
-          defaultModel: nextModel,
-          savingModel: false,
-        }));
-        applyPlatformRuntimeConfig(nextModel);
+        await persistPlatformModelSelection(model);
         void refreshAgents();
-      } catch (err) {
-        setPlatformState((current) => ({
-          ...current,
-          savingModel: false,
-          error: err instanceof Error ? err.message : '模型保存失败',
-        }));
+      } catch {
+        // persistPlatformModelSelection already exposes the error in the
+        // platform bar; keep this handler async for the select control.
       }
     },
-    [applyPlatformRuntimeConfig, refreshAgents],
+    [persistPlatformModelSelection, refreshAgents],
   );
 
   useEffect(() => {
@@ -2373,7 +2436,7 @@ function AppInner() {
         id={route.designSystemId}
         selectedId={config.designSystemId}
         config={config}
-        agents={agents}
+        agents={platformAwareAgents}
         onBack={() => navigate({ kind: 'home', view: 'design-systems' })}
         onOpenProject={(projectId) => void handleOpenProject(projectId)}
         onSetDefault={handleChangeDefaultDesignSystem}
@@ -2393,7 +2456,7 @@ function AppInner() {
         routeFileName={route.kind === 'project' ? route.fileName : null}
         routeConversationId={route.kind === 'project' ? route.conversationId : null}
         config={config}
-        agents={agents}
+        agents={platformAwareAgents}
         skills={enabledFunctionalSkills}
         designTemplates={designTemplates}
         designSystems={designSystems}
@@ -2434,7 +2497,7 @@ function AppInner() {
         onDeleteTemplate={handleDeleteTemplate}
         promptTemplates={promptTemplates}
         defaultDesignSystemId={config.designSystemId}
-        agents={agents}
+        agents={platformAwareAgents}
         agentsLoading={agentsLoading}
         config={config}
         providerModelsCache={providerModelsCache}
@@ -2514,7 +2577,7 @@ function AppInner() {
       {settingsOpen ? (
         <SettingsDialog
           initial={config}
-          agents={agents}
+          agents={platformAwareAgents}
           agentsLoading={agentsLoading}
           daemonLive={daemonLive}
           appVersionInfo={appVersionInfo}

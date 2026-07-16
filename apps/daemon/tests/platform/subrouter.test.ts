@@ -31,7 +31,7 @@ describe('SubrouterPlatform Codex runtime', () => {
       'aws123',
       'platform-key',
       'https://subrouter.example.com',
-      'claude-sonnet-4-20250514',
+      'gpt-5.4',
       timestamp,
       timestamp,
     );
@@ -43,7 +43,7 @@ describe('SubrouterPlatform Codex runtime', () => {
 
     const runtime = service.runtimeForUser('sr_platform_user');
 
-    expect(runtime.model).toBe('claude-sonnet-4-20250514');
+    expect(runtime.model).toBe('gpt-5.4');
     expect(runtime.baseUrl).toBe('https://subrouter.example.com/v1');
     expect(runtime.agentEnv).toMatchObject({
       OPENAI_BASE_URL: 'https://subrouter.example.com/v1',
@@ -54,7 +54,7 @@ describe('SubrouterPlatform Codex runtime', () => {
 
     const config = readFileSync(join(runtime.agentEnv.CODEX_HOME, 'config.toml'), 'utf8');
     expect(config).toContain('model_provider = "open_design_platform"');
-    expect(config).toContain('model = "claude-sonnet-4-20250514"');
+    expect(config).toContain('model = "gpt-5.4"');
     expect(config).toContain('[model_providers.open_design_platform]');
     expect(config).toContain('base_url = "https://subrouter.example.com/v1"');
     expect(config).toContain('env_key = "OPENAI_API_KEY"');
@@ -72,7 +72,7 @@ describe('SubrouterPlatform Codex runtime', () => {
     expect(secondRuntime.agentEnv.CODEX_HOME).toBe(firstRuntime.agentEnv.CODEX_HOME);
     const config = readFileSync(join(secondRuntime.agentEnv.CODEX_HOME, 'config.toml'), 'utf8');
     expect(config).toContain('model = "gpt-5.5"');
-    expect(config).not.toContain('claude-sonnet-4-20250514');
+    expect(config).not.toContain('gpt-5.4');
   });
 
   it('keeps Railway account APIs private but sends Codex Responses traffic to the public gateway', () => {
@@ -265,6 +265,43 @@ describe('SubrouterPlatform Codex runtime', () => {
     fetchMock.mockRestore();
   });
 
+  it('only exposes Responses-compatible models and prefers GPT over Claude', async () => {
+    const service = createPlatformUser();
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        success: true,
+        data: [
+          { model_name: 'claude-sonnet-4-20250514', category: 'chat' },
+          { model_name: 'gpt-5.5', category: 'chat' },
+          { model_name: 'deepseek-chat', category: 'chat' },
+        ],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    );
+
+    const result = await service.fetchModels('sr_platform_user');
+
+    expect(result.models.map((model) => model.id)).toEqual(['gpt-5.5']);
+    expect(result.defaultModel).toBe('gpt-5.5');
+    expect(service.rowForUser('sr_platform_user').default_model).toBe('gpt-5.5');
+    fetchMock.mockRestore();
+  });
+
+  it('allows an explicitly configured Responses-compatible model id', async () => {
+    const service = createPlatformUser();
+    service.env.OD_SUBROUTER_RESPONSES_MODELS = 'claude-sonnet-4-20250514';
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        success: true,
+        data: [{ model_name: 'claude-sonnet-4-20250514', category: 'chat' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    );
+
+    const result = await service.fetchModels('sr_platform_user');
+
+    expect(result.models.map((model) => model.id)).toEqual(['claude-sonnet-4-20250514']);
+    fetchMock.mockRestore();
+  });
+
   it('fails clearly when a platform account has no selected text model', () => {
     const service = createPlatformUser();
     service.db.prepare('UPDATE platform_users SET default_model = ? WHERE id = ?')
@@ -272,6 +309,16 @@ describe('SubrouterPlatform Codex runtime', () => {
 
     expect(() => service.runtimeForUser('sr_platform_user')).toThrowError(
       expect.objectContaining({ code: 'NO_MODELS_AVAILABLE' }),
+    );
+  });
+
+  it('rejects a Chat Completions-only model before Codex can send Responses traffic', () => {
+    const service = createPlatformUser();
+    service.db.prepare('UPDATE platform_users SET default_model = ? WHERE id = ?')
+      .run('claude-sonnet-4-20250514', 'sr_platform_user');
+
+    expect(() => service.runtimeForUser('sr_platform_user')).toThrowError(
+      expect.objectContaining({ code: 'MODEL_UNSUPPORTED_FOR_CODEX' }),
     );
   });
 
@@ -287,8 +334,8 @@ describe('SubrouterPlatform Codex runtime', () => {
     const result = await service.fetchModels('sr_platform_user');
 
     expect(result.models).toEqual([]);
-    expect(result.defaultModel).toBe('claude-sonnet-4-20250514');
-    expect(service.rowForUser('sr_platform_user').default_model).toBe('claude-sonnet-4-20250514');
+    expect(result.defaultModel).toBe('gpt-5.4');
+    expect(service.rowForUser('sr_platform_user').default_model).toBe('gpt-5.4');
     fetchMock.mockRestore();
   });
 

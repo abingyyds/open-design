@@ -336,8 +336,8 @@ function pickDefaultModel(models: Array<{ id: string; type?: string }>): string 
   const textModels = models.filter((model) => model.type === 'text' && model.id).map((model) => model.id);
   const candidates = textModels.length > 0 ? textModels : models.map((model) => model.id).filter(Boolean);
   const preferences = [
-    /claude.*sonnet|sonnet/i,
     /gpt-5|gpt-4\.?1|gpt-4o|gpt-4|o3|o4/i,
+    /codex/i,
     /deepseek.*(v3|chat|pro)|deepseek-ai\/deepseek/i,
     /qwen.*(max|plus|72b|32b|coder)|qwen3/i,
     /glm.*(5|4\.5|4-5)|kimi|moonshot/i,
@@ -351,6 +351,29 @@ function pickDefaultModel(models: Array<{ id: string; type?: string }>): string 
 
 function textModels(models: Array<{ id: string; type?: string }>) {
   return models.filter((model) => model.type === 'text' && model.id);
+}
+
+// Codex 0.144+ only speaks the OpenAI Responses protocol. SubRouter/New API
+// can expose Claude, Gemini, Qwen, and other providers through
+// `/v1/chat/completions`, but those upstreams are not interchangeable with
+// Responses: sending a Claude model through `/v1/responses` returns a 404 even
+// though the Responses route itself exists. Keep the platform catalogue honest
+// so the UI cannot select a model that the configured Codex transport cannot
+// execute. Deployments can explicitly allow a future compatible id with
+// OD_SUBROUTER_RESPONSES_MODELS (comma/newline/semicolon separated).
+function isCodexResponsesModel(modelId: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const id = String(modelId || '').trim().toLowerCase();
+  if (!id) return false;
+  const allowlist = parseCandidates(env.OD_SUBROUTER_RESPONSES_MODELS);
+  if (allowlist.some((candidate) => candidate.toLowerCase() === id)) return true;
+  return /(?:^|[/:_-])(?:gpt(?:[-.:/]|$)|o[134](?:[-.:/]|$)|codex(?:[-.:/]|$))/.test(id);
+}
+
+function codexResponsesModels(
+  models: Array<{ id: string; type?: string }>,
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  return textModels(models).filter((model) => isCodexResponsesModel(model.id, env));
 }
 
 function publicMessage(error: unknown): string {
@@ -704,12 +727,14 @@ export class SubrouterPlatform {
     // Codex is the platform runtime.  Keep image/video catalogue entries out
     // of the account picker so a user cannot select a media-only model and
     // then receive an opaque Codex failure on the first run.
-    const models = textModels(await this.fetchModelsForLogin(login, key.key));
+    const models = codexResponsesModels(await this.fetchModelsForLogin(login, key.key), this.env);
     const existing = this.rowForUser(userId);
     const modelIds = new Set(models.map((model) => model.id));
     const defaultModel =
       modelIds.size === 0
-        ? String(existing?.default_model || '')
+        ? isCodexResponsesModel(String(existing?.default_model || ''), this.env)
+          ? String(existing?.default_model || '')
+          : ''
         : existing?.default_model && modelIds.has(existing.default_model)
           ? existing.default_model
           : pickDefaultModel(models);
@@ -970,10 +995,12 @@ export class SubrouterPlatform {
     if (models.length === 0) {
       models = await this.fetchGatewayModels(row.subrouter_base_url, apiKey).catch(() => []);
     }
-    models = textModels(models);
+    models = codexResponsesModels(models, this.env);
     const modelIds = new Set(models.map((model) => model.id));
     let defaultModel = models.length === 0
-      ? String(row.default_model || '')
+      ? isCodexResponsesModel(String(row.default_model || ''), this.env)
+        ? String(row.default_model || '')
+        : ''
       : row.default_model && modelIds.has(row.default_model)
         ? row.default_model
         : pickDefaultModel(models);
@@ -1000,6 +1027,13 @@ export class SubrouterPlatform {
     const model = String(row.default_model || '');
     if (!model) {
       throw new PlatformError('当前账号没有可用的文本模型，请检查订阅或联系管理员', 503, 'NO_MODELS_AVAILABLE');
+    }
+    if (!isCodexResponsesModel(model, this.env)) {
+      throw new PlatformError(
+        '当前模型仅支持 Chat Completions，Codex CLI 需要 Responses 兼容模型，请重新选择 GPT/Codex 模型',
+        409,
+        'MODEL_UNSUPPORTED_FOR_CODEX',
+      );
     }
     fs.mkdirSync(home, { recursive: true });
     writeCodexPlatformConfig(home, baseUrl, model);

@@ -14,11 +14,15 @@ OD_CODEX_SANDBOX=danger-full-access
 SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
 OD_SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
 OD_SUBROUTER_GATEWAY_BASE_URL=https://api.subrouter.com
+OD_SUBROUTER_RESPONSES_MODELS=
 ```
 
 The private Railway URL is used for login and account management. Codex model
 traffic must use the public gateway because Codex requires `/v1/responses`,
 which is not exposed by the current private SubRouter service.
+The platform model picker only exposes OpenAI/Codex-shaped models that are
+compatible with that Responses transport. If a deployment has an additional
+Responses-compatible model id, add it to `OD_SUBROUTER_RESPONSES_MODELS`.
 
 Railway provides `PORT` automatically. Do not set `OD_PORT` unless you have a
 specific reason to override local runs.

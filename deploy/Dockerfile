@@ -115,6 +115,9 @@ ENV OD_CODEX_SANDBOX=danger-full-access
 ENV SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
 ENV OD_SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
 ENV OD_SUBROUTER_GATEWAY_BASE_URL=https://api.subrouter.com
+# Optional comma/newline-separated allowlist for additional model ids that the
+# deployed Responses gateway is known to support.
+ENV OD_SUBROUTER_RESPONSES_MODELS=
 
 EXPOSE 7456
 
