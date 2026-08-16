@@ -231,6 +231,7 @@ function renderSettingsDialog(
     initialSection?: SettingsSection;
     appVersionInfo?: AppVersionInfo | null;
     welcome?: boolean;
+    platformMode?: boolean;
   } = {},
 ) {
   const onPersist = vi.fn();
@@ -243,6 +244,7 @@ function renderSettingsDialog(
       initial={{ ...baseConfig, ...initial }}
       agents={options.agents ?? availableAgents}
       daemonLive={options.daemonLive ?? true}
+      platformMode={options.platformMode ?? false}
       appVersionInfo={options.appVersionInfo ?? null}
       initialSection={options.initialSection ?? 'execution'}
       welcome={options.welcome}
@@ -4228,5 +4230,40 @@ describe('SettingsDialog about interactions', () => {
       );
     });
     expect(screen.queryByText(en['settings.alreadyLatest'])).toBeNull();
+  });
+});
+
+describe('SettingsDialog execution section in hosted platform mode', () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('drops local-CLI affordances and keeps the model picker', () => {
+    renderSettingsDialog(
+      { mode: 'daemon', agentId: 'codex' },
+      { platformMode: true },
+    );
+
+    // Local-machine language for a runtime the user cannot reach.
+    expect(screen.queryByText(en['settings.localCli'])).toBeNull();
+    expect(screen.queryByText(en['settings.modeApiMeta'])).toBeNull();
+    expect(screen.queryByText(en['settings.codeAgentHint'])).toBeNull();
+    expect(screen.queryByRole('button', { name: en['settings.rescan'] })).toBeNull();
+    expect(screen.queryByText(en['settings.modelSourceLive'])).toBeNull();
+
+    // The section keeps its one job: choosing the platform model.
+    expect(screen.getAllByText(en['settings.platformModelCard']).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(en['settings.modelSourcePlatform']).length).toBeGreaterThan(0);
+    expect(
+      screen.getByRole('combobox', { name: en['settings.modelPicker'] }),
+    ).toBeTruthy();
+  });
+
+  it('keeps the local CLI section intact when platform mode is off', () => {
+    renderSettingsDialog({ mode: 'daemon', agentId: 'codex' });
+
+    expect(screen.getAllByText(en['settings.localCli']).length).toBeGreaterThan(0);
+    expect(screen.getByRole('button', { name: en['settings.rescan'] })).toBeTruthy();
+    expect(screen.queryAllByText(en['settings.platformModelCard'])).toHaveLength(0);
   });
 });

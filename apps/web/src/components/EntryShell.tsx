@@ -327,6 +327,8 @@ interface Props {
   // instead of hiding it during the seconds AMR's probe takes to settle.
   agentsLoading?: boolean;
   daemonLive: boolean;
+  /** Hosted platform mode — see InlineModelSwitcher.platformMode. */
+  platformMode?: boolean;
   onModeChange: (mode: ExecMode) => void;
   onAgentChange: (id: string) => void;
   onAgentModelChange: (
@@ -452,6 +454,7 @@ export function EntryShell({
   agents,
   agentsLoading = false,
   daemonLive,
+  platformMode = false,
   onModeChange,
   onAgentChange,
   onAgentModelChange,
@@ -726,6 +729,7 @@ export function EntryShell({
       providerModelsCache={activeProviderModelsCache}
       onProviderModelsCacheChange={activeSetProviderModelsCache}
       daemonLive={daemonLive}
+      platformMode={platformMode}
       onModeChange={onModeChange}
       onAgentChange={onAgentChange}
       onAgentModelChange={onAgentModelChange}
@@ -742,6 +746,7 @@ export function EntryShell({
       providerModelsCache={activeProviderModelsCache}
       onProviderModelsCacheChange={activeSetProviderModelsCache}
       daemonLive={daemonLive}
+      platformMode={platformMode}
       onModeChange={onModeChange}
       onAgentChange={onAgentChange}
       onAgentModelChange={onAgentModelChange}

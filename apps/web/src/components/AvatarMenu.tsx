@@ -20,6 +20,13 @@ interface Props {
   config: AppConfig;
   agents: AgentInfo[];
   daemonLive: boolean;
+  /**
+   * Hosted platform mode: the runtime lives on the server against the
+   * signed-in platform account, so mode switching, agent choice and PATH
+   * rescans describe machinery the user cannot reach. Only the model and
+   * reasoning pickers stay.
+   */
+  platformMode?: boolean;
   onModeChange: (mode: ExecMode) => void;
   onAgentChange: (id: string) => void;
   onAgentModelChange: (
@@ -48,6 +55,7 @@ export function AvatarMenu({
   config,
   agents,
   daemonLive,
+  platformMode = false,
   onModeChange,
   onAgentChange,
   onAgentModelChange,
@@ -281,9 +289,11 @@ export function AvatarMenu({
         >
           <div className="avatar-popover-head">
             <span className="who">
-              {config.mode === 'daemon'
-                ? t('avatar.localCli')
-                : apiProtocolLabel(config.apiProtocol)}
+              {platformMode
+                ? t('settings.platformModelCard')
+                : config.mode === 'daemon'
+                  ? t('avatar.localCli')
+                  : apiProtocolLabel(config.apiProtocol)}
             </span>
             <span className="where">
               {config.mode === 'api'
@@ -320,6 +330,8 @@ export function AvatarMenu({
             </a>
           ) : null}
 
+          {platformMode ? null : (
+          <>
           <button
             type="button"
             className={`avatar-item${config.mode === 'daemon' ? ' active' : ''}`}
@@ -372,11 +384,15 @@ export function AvatarMenu({
               <RemixIcon name="check-line" size={14} className="avatar-item-check" />
             ) : null}
           </button>
+          </>
+          )}
 
           {config.mode === 'daemon' && installedAgents.length > 0 ? (
             <>
-              <div className="avatar-section-label">{t('avatar.codeAgent')}</div>
-              {installedAgents.map((a) => {
+              {platformMode ? null : (
+                <div className="avatar-section-label">{t('avatar.codeAgent')}</div>
+              )}
+              {(platformMode ? [] : installedAgents).map((a) => {
                 const selected = config.agentId === a.id;
                 return (
                   <button
@@ -469,6 +485,7 @@ export function AvatarMenu({
                   ) : null}
                 </div>
               ) : null}
+              {platformMode ? null : (
               <button
                 type="button"
                 className="avatar-item"
@@ -481,6 +498,7 @@ export function AvatarMenu({
                 </span>
                 <span>{t('avatar.rescan')}</span>
               </button>
+              )}
             </>
           ) : null}
 

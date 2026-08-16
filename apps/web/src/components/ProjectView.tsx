@@ -334,6 +334,8 @@ interface Props {
   designTemplates: SkillSummary[];
   designSystems: DesignSystemSummary[];
   daemonLive: boolean;
+  /** Hosted platform mode — see AvatarMenu.platformMode. */
+  platformMode?: boolean;
   onModeChange: (mode: AppConfig['mode']) => void;
   onAgentChange: (id: string) => void;
   onAgentModelChange: (
@@ -860,6 +862,7 @@ export function ProjectView({
   designTemplates,
   designSystems,
   daemonLive,
+  platformMode = false,
   onModeChange,
   onAgentChange,
   onAgentModelChange,
@@ -6429,6 +6432,7 @@ export function ProjectView({
         config={config}
         agents={agents}
         daemonLive={daemonLive}
+        platformMode={platformMode}
         onModeChange={onModeChange}
         onOpen={() => {
           trackComposerBarClick(analytics.track, {

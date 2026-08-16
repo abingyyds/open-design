@@ -206,6 +206,13 @@ interface Props {
   agents: AgentInfo[];
   agentsLoading?: boolean;
   daemonLive: boolean;
+  /**
+   * Hosted platform mode: the agent runs on the server against the signed-in
+   * platform account, so local-CLI affordances (mode switch, PATH rescan,
+   * install state, connection test) describe machinery the user has no access
+   * to. The section collapses to the model picker alone.
+   */
+  platformMode?: boolean;
   appVersionInfo: AppVersionInfo | null;
   welcome?: boolean;
   initialSection?: SettingsSection;
@@ -1103,6 +1110,7 @@ export function SettingsDialog({
   agents,
   agentsLoading = false,
   daemonLive,
+  platformMode = false,
   appVersionInfo,
   welcome,
   initialSection = 'execution',
@@ -2907,7 +2915,9 @@ export function SettingsDialog({
   // BYOK content so "Local CLI" only renders once (in the seg-control tab),
   // not twice (heading + tab).
   const sectionHeader: Record<SettingsSection, { title: string; subtitle: string }> = {
-    execution: { title: t('settings.title'), subtitle: t('settings.subtitle') },
+    execution: platformMode
+      ? { title: t('settings.modelPicker'), subtitle: t('settings.platformModelHint') }
+      : { title: t('settings.title'), subtitle: t('settings.subtitle') },
     instructions: {
       title: t('settings.instructionsTitle'),
       subtitle: t('settings.instructionsSubtitle'),
@@ -3062,12 +3072,14 @@ export function SettingsDialog({
       ? CUSTOM_MODEL_SENTINEL
       : modelValue;
     const modelSource = selected.modelsSource ?? 'fallback';
-    const modelSourceLabel =
-      modelSource === 'live'
+    const modelSourceLabel = platformMode
+      ? t('settings.modelSourcePlatform')
+      : modelSource === 'live'
         ? t('settings.modelSourceLive')
         : t('settings.modelSourceFallback');
-    const modelSourceHint =
-      modelSource === 'live'
+    const modelSourceHint = platformMode
+      ? t('settings.platformModelHint')
+      : modelSource === 'live'
         ? selected.supportsCustomModel === false
           ? t('settings.modelPickerLiveCatalogOnlyHint')
           : t('settings.modelPickerLiveHint')
@@ -3307,8 +3319,14 @@ export function SettingsDialog({
             >
               <Icon name="sliders" size={18} />
               <span>
-                <strong>{t('settings.envConfigure')}</strong>
-                <small>{`${t('settings.localCli')} / ${t('settings.modeApiMeta')}`}</small>
+                <strong>
+                  {platformMode ? t('settings.modelPicker') : t('settings.envConfigure')}
+                </strong>
+                <small>
+                  {platformMode
+                    ? t('settings.platformModelCard')
+                    : `${t('settings.localCli')} / ${t('settings.modeApiMeta')}`}
+                </small>
               </span>
             </button>
             <button
@@ -3491,6 +3509,7 @@ export function SettingsDialog({
           <div className="settings-content" ref={settingsContentRef}>
           {activeSection === 'execution' ? (
             <>
+              {platformMode ? null : (
               <div
                 className="seg-control"
                 role="tablist"
@@ -3534,6 +3553,7 @@ export function SettingsDialog({
                   <span className="seg-meta">{t('settings.modeApi')}</span>
                 </button>
               </div>
+              )}
               {cfg.mode === 'api' ? (
                 <div
                   className="protocol-chips"
@@ -3578,12 +3598,14 @@ export function SettingsDialog({
               ) : null}
           {cfg.mode === 'daemon' ? (
             <section className="settings-section">
+              {platformMode ? null : (
               <div className="section-head">
                 <div>
                   <p className="hint">{t('settings.codeAgentHint')}</p>
                 </div>
               </div>
-              {initialAgentScanRunning ? (
+              )}
+              {platformMode ? null : initialAgentScanRunning ? (
                 <div className="agent-scan-card" role="status" aria-live="polite">
                   <div className="agent-scan-card__stage">
                     <span className="agent-scan-card__ring" aria-hidden />
@@ -4184,7 +4206,27 @@ export function SettingsDialog({
                   ) : null}
                 </>
               )}
-              {(() => {
+              {platformMode
+                ? (() => {
+                    // The agent grid above is hidden in platform mode, and with
+                    // it the model picker each card renders. Surface the picker
+                    // for the active agent on its own so the section still has
+                    // its one purpose. `available` is deliberately not required:
+                    // the runtime lives on the server, not on this machine.
+                    const selected =
+                      agents.find((a) => a.id === cfg.agentId) ?? agents[0];
+                    if (!selected) return null;
+                    return (
+                      <div className="agent-card agent-card-installed active">
+                        <div className="agent-card-body">
+                          <strong>{t('settings.platformModelCard')}</strong>
+                        </div>
+                        {renderAgentModelConfig(selected)}
+                      </div>
+                    );
+                  })()
+                : null}
+              {platformMode ? null : (() => {
                 const selected = agents.find(
                   (a) => a.id === cfg.agentId && a.available,
                 );

@@ -2457,6 +2457,7 @@ function AppInner() {
         routeConversationId={route.kind === 'project' ? route.conversationId : null}
         config={config}
         agents={platformAwareAgents}
+        platformMode={platformState.enabled && platformState.authenticated}
         skills={enabledFunctionalSkills}
         designTemplates={designTemplates}
         designSystems={designSystems}
@@ -2499,6 +2500,7 @@ function AppInner() {
         defaultDesignSystemId={config.designSystemId}
         agents={platformAwareAgents}
         agentsLoading={agentsLoading}
+        platformMode={platformState.enabled && platformState.authenticated}
         config={config}
         providerModelsCache={providerModelsCache}
         onProviderModelsCacheChange={setProviderModelsCache}
@@ -2580,6 +2582,7 @@ function AppInner() {
           agents={platformAwareAgents}
           agentsLoading={agentsLoading}
           daemonLive={daemonLive}
+          platformMode={platformState.enabled && platformState.authenticated}
           appVersionInfo={appVersionInfo}
           welcome={settingsWelcome}
           initialSection={settingsInitialSection}

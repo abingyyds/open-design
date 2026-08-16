@@ -70,6 +70,12 @@ interface Props {
   providerModelsCache?: ProviderModelsCache;
   compact?: boolean;
   daemonLive: boolean;
+  /**
+   * Hosted platform mode: the runtime runs server-side against the signed-in
+   * platform account. Mode switching and agent choice are not the user's to
+   * make there, so the popover narrows to the model picker.
+   */
+  platformMode?: boolean;
   onModeChange: (mode: ExecMode) => void;
   onAgentChange: (id: string) => void;
   onAgentModelChange: (
@@ -144,6 +150,7 @@ export function InlineModelSwitcher({
   providerModelsCache,
   compact = false,
   daemonLive,
+  platformMode = false,
   onModeChange,
   onAgentChange,
   onAgentModelChange,
@@ -542,8 +549,9 @@ export function InlineModelSwitcher({
 
   // Chip text — keep it tight so the pill doesn't wrap on small viewports.
   // CLI: "Claude · Sonnet 4.5"; BYOK: "Anthropic · sonnet-4.5".
-  const chipMode =
-    config.mode === 'daemon'
+  const chipMode = platformMode
+    ? t('settings.platformModelCard')
+    : config.mode === 'daemon'
       ? t('inlineSwitcher.chipCli')
       : t('inlineSwitcher.chipByok');
   const chipPrimary =
@@ -637,6 +645,7 @@ export function InlineModelSwitcher({
           role="menu"
           data-testid="inline-model-switcher-popover"
         >
+          {platformMode ? null : (
           <div className="inline-switcher__row">
             <span className="inline-switcher__label">
               {t('inlineSwitcher.modeLabel')}
@@ -699,9 +708,11 @@ export function InlineModelSwitcher({
               </button>
             </div>
           </div>
+          )}
 
           {config.mode === 'daemon' ? (
             <>
+              {platformMode ? null : (
               <div className="inline-switcher__row">
                 <span className="inline-switcher__label">
                   {t('inlineSwitcher.agentLabel')}
@@ -803,6 +814,7 @@ export function InlineModelSwitcher({
                   </div>
                 )}
               </div>
+              )}
 
               {currentAgent &&
               currentAgent.models &&

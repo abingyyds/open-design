@@ -66,6 +66,8 @@ interface Props {
   integrationInitialTab?: IntegrationTab;
   composioConfigLoading?: boolean;
   daemonLive: boolean;
+  /** Hosted platform mode — see EntryShell.platformMode. */
+  platformMode?: boolean;
   onModeChange: (mode: ExecMode) => void;
   onAgentChange: (id: string) => void;
   onAgentModelChange: (
@@ -233,6 +235,7 @@ export function EntryView({
   integrationInitialTab,
   composioConfigLoading = false,
   daemonLive,
+  platformMode = false,
   onModeChange,
   onAgentChange,
   onAgentModelChange,
@@ -351,6 +354,7 @@ export function EntryView({
       agents={agents}
       {...(agentsLoading !== undefined ? { agentsLoading } : {})}
       daemonLive={daemonLive}
+      platformMode={platformMode}
       onModeChange={onModeChange}
       onAgentChange={onAgentChange}
       onAgentModelChange={onAgentModelChange}

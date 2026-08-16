@@ -55,7 +55,7 @@ function renderSwitcher(
   config: Partial<AppConfig> = {},
   agents: AgentInfo[] = [amrAgent],
   providerModelsCache: Record<string, ProviderModelOption[]> = {},
-  options: { compact?: boolean } = {},
+  options: { compact?: boolean; platformMode?: boolean } = {},
 ) {
   const onAgentModelChange = vi.fn();
   const view = render(
@@ -65,6 +65,7 @@ function renderSwitcher(
       providerModelsCache={providerModelsCache}
       compact={options.compact}
       daemonLive={true}
+      platformMode={options.platformMode ?? false}
       onModeChange={vi.fn()}
       onAgentChange={vi.fn()}
       onAgentModelChange={onAgentModelChange}
@@ -1019,5 +1020,31 @@ describe('InlineModelSwitcher AMR row', () => {
     expect(
       within(modelPopover).getByRole('option', { name: 'Claude 3.5 Haiku' }),
     ).toBeTruthy();
+  });
+});
+
+describe('InlineModelSwitcher in hosted platform mode', () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('drops the mode segment and agent grid but keeps the model picker', () => {
+    renderSwitcher({ mode: 'daemon', agentId: 'codex' }, [codexAgent], {}, {
+      platformMode: true,
+    });
+    fireEvent.click(screen.getByTestId('inline-model-switcher-chip'));
+
+    expect(screen.queryByTestId('inline-model-switcher-mode-daemon')).toBeNull();
+    expect(screen.queryByTestId('inline-model-switcher-mode-api')).toBeNull();
+    expect(screen.queryByText('inlineSwitcher.agentLabel')).toBeNull();
+    expect(screen.getByTestId('inline-model-switcher-agent-model')).toBeTruthy();
+  });
+
+  it('keeps the mode segment and agent grid when platform mode is off', () => {
+    renderSwitcher({ mode: 'daemon', agentId: 'codex' }, [codexAgent]);
+    fireEvent.click(screen.getByTestId('inline-model-switcher-chip'));
+
+    expect(screen.getByTestId('inline-model-switcher-mode-daemon')).toBeTruthy();
+    expect(screen.getByTestId('inline-model-switcher-mode-api')).toBeTruthy();
   });
 });

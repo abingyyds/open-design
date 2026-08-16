@@ -67,6 +67,7 @@ function renderMenu({
   config = baseConfig,
   agents = [codexAgent, claudeAgent],
   daemonLive = true,
+  platformMode = false,
   onModeChange = vi.fn<ModeChangeHandler>(),
   onAgentChange = vi.fn<AgentChangeHandler>(),
   onAgentModelChange = vi.fn<AgentModelChangeHandler>(),
@@ -76,6 +77,7 @@ function renderMenu({
   config?: AppConfig;
   agents?: AgentInfo[];
   daemonLive?: boolean;
+  platformMode?: boolean;
   onModeChange?: ReturnType<typeof vi.fn<ModeChangeHandler>>;
   onAgentChange?: ReturnType<typeof vi.fn<AgentChangeHandler>>;
   onAgentModelChange?: ReturnType<typeof vi.fn<AgentModelChangeHandler>>;
@@ -87,6 +89,7 @@ function renderMenu({
       config={config}
       agents={agents}
       daemonLive={daemonLive}
+      platformMode={platformMode}
       onModeChange={onModeChange}
       onAgentChange={onAgentChange}
       onAgentModelChange={onAgentModelChange}
@@ -285,5 +288,36 @@ describe('AvatarMenu', () => {
       '/api/integrations/vela/analytics-entry',
       expect.objectContaining({ method: 'POST' }),
     );
+  });
+});
+
+describe('AvatarMenu in hosted platform mode', () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('drops mode switching, agent choice and PATH rescan but keeps the model picker', () => {
+    renderMenu({ platformMode: true });
+    openMenu();
+
+    expect(screen.queryByText('avatar.useLocal')).toBeNull();
+    expect(screen.queryByText('avatar.useApi')).toBeNull();
+    expect(screen.queryByText('avatar.codeAgent')).toBeNull();
+    expect(screen.queryByText('avatar.rescan')).toBeNull();
+    expect(screen.queryByTestId('avatar-agent-option-codex')).toBeNull();
+    expect(screen.queryByTestId('avatar-agent-option-claude')).toBeNull();
+
+    expect(screen.getByText('avatar.modelLabel')).toBeTruthy();
+    expect(screen.getByText('settings.platformModelCard')).toBeTruthy();
+  });
+
+  it('keeps every local-CLI control when platform mode is off', () => {
+    renderMenu();
+    openMenu();
+
+    expect(screen.getByText('avatar.useLocal')).toBeTruthy();
+    expect(screen.getByText('avatar.codeAgent')).toBeTruthy();
+    expect(screen.getByText('avatar.rescan')).toBeTruthy();
+    expect(screen.getByTestId('avatar-agent-option-codex')).toBeTruthy();
   });
 });
