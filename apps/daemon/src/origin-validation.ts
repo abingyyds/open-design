@@ -1,3 +1,5 @@
+import { hostedPlatformEnabled } from './platform/deployment.js';
+
 export interface ParsedHostHeader {
   hostname: string;
   host: string;
@@ -116,6 +118,40 @@ export function isAllowedBrowserHost(
   return isLoopbackOrPrivateLanHost(requestHost.hostname);
 }
 
+/**
+ * A public DNS host reached on the scheme default port — the shape a hosted
+ * deployment or TLS-terminating proxy presents to the browser while the daemon
+ * itself listens on an internal port. IP literals, loopback and private LAN
+ * names stay out: those belong to the stricter local path, where the daemon is
+ * network-isolated and the hostname is attacker-reachable via DNS rebinding.
+ */
+function isHostedPublicHost(hostHeader: unknown): boolean {
+  const raw = String(headerValue(hostHeader) || '').trim();
+  // An explicit port means the browser reached the daemon's own listener, not
+  // a hosted edge on 443/80. It also excludes bracketed IPv6 hosts.
+  if (!raw || raw.includes(':')) return false;
+  const parsed = parseHostHeader(raw);
+  if (!parsed) return false;
+  return !isIpLiteralHostname(parsed.hostname) && !isLoopbackOrPrivateLanHost(parsed.hostname);
+}
+
+/**
+ * Same-origin as seen from a hosted deployment: the browser Origin names the
+ * same public host the request carries in Host, on the scheme default port.
+ */
+export function isHostedSameOrigin(origin: unknown, hostHeader: unknown): boolean {
+  const requestHost = parseHostHeader(hostHeader);
+  if (!requestHost || !isHostedPublicHost(hostHeader)) return false;
+  let parsedOrigin;
+  try {
+    parsedOrigin = new URL(String(origin));
+  } catch {
+    return false;
+  }
+  if (parsedOrigin.protocol !== 'http:' && parsedOrigin.protocol !== 'https:') return false;
+  return parsedOrigin.port === '' && parsedOrigin.host === requestHost.host;
+}
+
 export function isAllowedBrowserOrigin(
   origin: unknown,
   hostHeader: unknown,
@@ -135,19 +171,7 @@ export function isAllowedBrowserOrigin(
 
   const requestHost = parseHostHeader(hostHeader);
   if (!requestHost) return false;
-  // Hosted platforms and TLS-terminating proxies expose the app at a public
-  // DNS origin such as https://example.com while forwarding to the daemon on
-  // an internal port. When that browser Origin host exactly matches the HTTP
-  // Host header, this is still same-origin even though the external port is
-  // the scheme default (443/80), not the daemon listener port. Keep IP literal
-  // hosts on the stricter local/LAN path below.
-  if (
-    parsedOrigin.host === requestHost.host &&
-    parsedOrigin.port === '' &&
-    !isIpLiteralHostname(parsedOrigin.hostname)
-  ) {
-    return true;
-  }
+  if (isHostedSameOrigin(origin, hostHeader)) return true;
 
   const schemes = ['http', 'https'];
   const loopbackHosts = ['127.0.0.1', 'localhost', '[::1]'];
@@ -193,7 +217,14 @@ export function isLocalSameOrigin(
     // signal is present.
     const fetchSite = headerValue(req.headers?.['sec-fetch-site']);
     if (fetchSite === 'same-origin') {
-      return isAllowedBrowserHost(host, ports, bindHost, extraAllowedOrigins);
+      if (isAllowedBrowserHost(host, ports, bindHost, extraAllowedOrigins)) return true;
+      // A hosted daemon is not loopback-isolated, so the DNS-rebinding vector
+      // that makes a bare Host header untrustworthy for a local daemon does
+      // not apply: an attacker gains nothing by pointing their own hostname at
+      // a service that is already publicly reachable. Accept the hosted shape
+      // there so same-origin GETs (which browsers send without an Origin) work
+      // without requiring OD_ALLOWED_ORIGINS.
+      return hostedPlatformEnabled(env) && isHostedPublicHost(host);
     }
     return false;
   }
@@ -206,6 +237,11 @@ export function isLocalSameOrigin(
   // a client-supplied origin that exactly matches an explicitly allow-
   // listed entry is the documented escape hatch for these deployments.
   if (extraAllowedOrigins.includes(origin)) return true;
+  // Checked before the host gate below: a hosted deployment's Host header is a
+  // public DNS name on 443/80, which that gate (loopback / bind host / explicit
+  // allow-list only) can never match. Skipping this would leave the route-level
+  // guard rejecting requests the global /api middleware already accepts.
+  if (isHostedSameOrigin(origin, host)) return true;
   if (!isAllowedBrowserHost(host, ports, bindHost, extraAllowedOrigins)) return false;
   return isAllowedBrowserOrigin(origin, host, ports, bindHost, extraAllowedOrigins);
 }

@@ -812,3 +812,72 @@ describe('isLocalSameOrigin: Sec-Fetch-Site fallback for no-Origin same-origin G
     expect(isLocalSameOrigin(req, 7456, env)).toBe(false);
   });
 });
+
+// Route-level guards (`PUT /api/app-config`, `/api/dir-exists`, the MCP
+// config routes, …) call isLocalSameOrigin in addition to the global /api
+// middleware. A hosted deployment serves the app on a public DNS origin
+// whose external port is the scheme default while the daemon listens on an
+// internal port, so both entry points have to agree on what "same origin"
+// means there.
+describe('isLocalSameOrigin: hosted platform deployments', () => {
+  const HOSTED_HOST = 'open-design-production-5b51.up.railway.app';
+  const hostedEnv = {
+    OD_BIND_HOST: '0.0.0.0',
+    OD_PLATFORM_ENABLED: '1',
+  } as NodeJS.ProcessEnv;
+  const localEnv = { OD_BIND_HOST: '127.0.0.1' } as NodeJS.ProcessEnv;
+
+  it('accepts a same-host browser write (PUT /api/app-config) without OD_ALLOWED_ORIGINS', () => {
+    const req = {
+      headers: { host: HOSTED_HOST, origin: `https://${HOSTED_HOST}` },
+    };
+    expect(isLocalSameOrigin(req, 8080, hostedEnv)).toBe(true);
+  });
+
+  it('accepts a no-Origin same-origin GET when the daemon runs in hosted platform mode', () => {
+    const req = {
+      headers: { host: HOSTED_HOST, 'sec-fetch-site': 'same-origin' },
+    };
+    expect(isLocalSameOrigin(req, 8080, hostedEnv)).toBe(true);
+  });
+
+  it('still rejects a no-Origin same-origin GET for a loopback daemon (Host alone is forgeable)', () => {
+    const req = {
+      headers: { host: HOSTED_HOST, 'sec-fetch-site': 'same-origin' },
+    };
+    expect(isLocalSameOrigin(req, 7456, localEnv)).toBe(false);
+  });
+
+  it('rejects a cross-site Origin targeting the hosted app host', () => {
+    const req = {
+      headers: { host: HOSTED_HOST, origin: 'https://attacker.example' },
+    };
+    expect(isLocalSameOrigin(req, 8080, hostedEnv)).toBe(false);
+  });
+
+  it('rejects an Origin whose explicit port does not match the Host header', () => {
+    const req = {
+      headers: { host: HOSTED_HOST, origin: `https://${HOSTED_HOST}:8443` },
+    };
+    expect(isLocalSameOrigin(req, 8080, hostedEnv)).toBe(false);
+  });
+
+  it('rejects a hosted no-Origin request whose Sec-Fetch-Site is cross-site', () => {
+    const req = {
+      headers: { host: HOSTED_HOST, 'sec-fetch-site': 'cross-site' },
+    };
+    expect(isLocalSameOrigin(req, 8080, hostedEnv)).toBe(false);
+  });
+
+  it('rejects a hosted no-Origin request with no Sec-Fetch-Site at all', () => {
+    const req = { headers: { host: HOSTED_HOST } };
+    expect(isLocalSameOrigin(req, 8080, hostedEnv)).toBe(false);
+  });
+
+  it('keeps IP-literal hosts on the strict loopback/LAN path in hosted mode', () => {
+    const req = {
+      headers: { host: '203.0.113.10', origin: 'http://203.0.113.10' },
+    };
+    expect(isLocalSameOrigin(req, 8080, hostedEnv)).toBe(false);
+  });
+});

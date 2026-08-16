@@ -4,6 +4,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Express, NextFunction, Request, Response } from 'express';
+import { hostedPlatformEnabled } from './deployment.js';
 
 const DEFAULT_SUBROUTER_BASE_URL = 'http://subrouter.railway.internal:8080';
 const DEFAULT_PUBLIC_SUBROUTER_BASE_URL = 'https://api.subrouter.com';
@@ -25,21 +26,8 @@ export class PlatformError extends Error {
   }
 }
 
-function truthy(value: unknown): boolean {
-  const text = String(value || '').trim().toLowerCase();
-  return text === '1' || text === 'true' || text === 'yes' || text === 'on';
-}
-
-function falsey(value: unknown): boolean {
-  const text = String(value || '').trim().toLowerCase();
-  return text === '0' || text === 'false' || text === 'no' || text === 'off';
-}
-
 export function subrouterPlatformEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const explicit = env.OD_PLATFORM_ENABLED ?? env.OPEN_DESIGN_PLATFORM_ENABLED;
-  if (explicit !== undefined) return truthy(explicit);
-  if (falsey(env.OD_PLATFORM_ENABLED)) return false;
-  return Boolean(env.RAILWAY_ENVIRONMENT || env.RAILWAY_PROJECT_ID);
+  return hostedPlatformEnabled(env);
 }
 
 function now(): number {
