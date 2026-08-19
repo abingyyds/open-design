@@ -2814,8 +2814,9 @@ function PlatformAccountBar({
       </div>
       <div className="platform-account-bar__controls">
         <label className="platform-account-bar__model">
-          <span>模型</span>
+          <span>选择模型</span>
           <select
+            aria-label="选择 SubRouter 模型"
             value={selectedModel}
             disabled={savingModel || models.length === 0}
             onChange={(event) => onModelChange(event.target.value)}

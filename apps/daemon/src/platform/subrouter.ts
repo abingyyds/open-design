@@ -178,6 +178,10 @@ function extractUser(payload: unknown): Record<string, unknown> {
     : {};
 }
 
+function hasUserIdentity(user: Record<string, unknown>): boolean {
+  return Boolean(user.id || user.username || user.email);
+}
+
 function normalizeHost(value: unknown): string {
   const text = String(value || '').trim();
   return text.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').trim();
@@ -553,7 +557,7 @@ export class SubrouterPlatform {
     return { ok: true, enabled: this.enabled };
   }
 
-  async login(username: string, password: string) {
+  async login(username: string, password: string, turnstileToken?: string) {
     const cleanUsername = String(username || '').trim();
     const cleanPassword = String(password || '').trim();
     if (!cleanUsername || !cleanPassword) throw new PlatformError('用户名和密码不能为空');
@@ -561,7 +565,13 @@ export class SubrouterPlatform {
     let lastError: unknown = new PlatformError('登录失败');
     for (const baseUrl of baseUrlCandidates()) {
       try {
-        const login = await this.loginSubrouter(baseUrl, cleanUsername, cleanPassword);
+        const login = await this.loginSubrouter(
+          baseUrl,
+          cleanUsername,
+          cleanPassword,
+          undefined,
+          turnstileToken,
+        );
         const account = await this.prepareAccount(login, cleanUsername);
         const sessionToken = this.createSession(account.user.id);
         return { sessionToken, ...account };
@@ -582,7 +592,12 @@ export class SubrouterPlatform {
     throw new PlatformError(publicMessage(lastError), 401, 'LOGIN_FAILED');
   }
 
-  async loginWithTwoFactor(username: string, password: string, code: string) {
+  async loginWithTwoFactor(
+    username: string,
+    password: string,
+    code: string,
+    turnstileToken?: string,
+  ) {
     const cleanUsername = String(username || '').trim();
     const cleanPassword = String(password || '').trim();
     const cleanCode = String(code || '').trim();
@@ -591,7 +606,13 @@ export class SubrouterPlatform {
     let lastError: unknown = new PlatformError('登录失败');
     for (const baseUrl of baseUrlCandidates()) {
       try {
-        const login = await this.loginSubrouter(baseUrl, cleanUsername, cleanPassword, cleanCode);
+        const login = await this.loginSubrouter(
+          baseUrl,
+          cleanUsername,
+          cleanPassword,
+          cleanCode,
+          turnstileToken,
+        );
         const account = await this.prepareAccount(login, cleanUsername);
         const sessionToken = this.createSession(account.user.id);
         return { sessionToken, ...account };
@@ -605,9 +626,17 @@ export class SubrouterPlatform {
     throw new PlatformError(publicMessage(lastError), 401, 'LOGIN_FAILED');
   }
 
-  async loginSubrouter(baseUrl: string, username: string, password: string, twoFactorCode?: string) {
+  async loginSubrouter(
+    baseUrl: string,
+    username: string,
+    password: string,
+    twoFactorCode?: string,
+    turnstileToken?: string,
+  ) {
     const root = normalizeBaseUrl(baseUrl);
-    const response = await fetchUpstream(`${root}/api/user/login`, {
+    const loginUrl = new URL(`${root}/api/user/login`);
+    if (turnstileToken?.trim()) loginUrl.searchParams.set('turnstile', turnstileToken.trim());
+    const response = await fetchUpstream(loginUrl.toString(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
@@ -668,7 +697,7 @@ export class SubrouterPlatform {
           ...(verificationPayload && typeof verificationPayload === 'object'
             ? verificationPayload as Record<string, unknown>
             : {}),
-          ...(Object.keys(verifiedUser).length > 0
+          ...(hasUserIdentity(verifiedUser)
             ? { user: verifiedUser }
             : initialUser
               ? { user: initialUser }
@@ -884,7 +913,13 @@ export class SubrouterPlatform {
     const name = `${AUTO_KEY_PREFIX}-${Date.now()}`;
     const pathName = login.distributor ? '/api/user/self/distributor/token/create' : '/api/token/';
     const body = login.distributor
-      ? { name, key_group_id: 0 }
+      ? {
+          name,
+          key_group_id: 0,
+          group: 'subrouter',
+          include_official_channels: true,
+          official_key_max_discount: 0,
+        }
       : {
           name,
           group: 'subrouter',
@@ -892,6 +927,8 @@ export class SubrouterPlatform {
           remain_quota: 0,
           unlimited_quota: true,
           model_limits_enabled: false,
+          include_official_channels: true,
+          official_key_max_discount: 0,
         };
     const payload = await parseResponse(
       await fetchUpstream(`${root}${pathName}`, {
@@ -1191,9 +1228,12 @@ export function registerSubrouterPlatformRoutes(app: Express, platform: Subroute
         : typeof req.body?.code === 'string'
           ? req.body.code
           : '';
+      const turnstileToken = typeof req.body?.turnstileToken === 'string'
+        ? req.body.turnstileToken
+        : '';
       const result = twoFactorCode.trim()
-        ? await platform.loginWithTwoFactor(username, password, twoFactorCode)
-        : await platform.login(username, password);
+        ? await platform.loginWithTwoFactor(username, password, twoFactorCode, turnstileToken)
+        : await platform.login(username, password, turnstileToken);
       res.cookie(SESSION_COOKIE, result.sessionToken, {
         httpOnly: true,
         sameSite: 'lax',

@@ -92,6 +92,7 @@ export async function loginPlatform(
   username: string,
   password: string,
   twoFactorCode?: string,
+  turnstileToken?: string,
 ): Promise<PlatformLoginResponse> {
   const response = await fetch('/api/platform/login', {
     method: 'POST',
@@ -101,6 +102,7 @@ export async function loginPlatform(
       username,
       password,
       ...(twoFactorCode?.trim() ? { twoFactorCode: twoFactorCode.trim() } : {}),
+      ...(turnstileToken?.trim() ? { turnstileToken: turnstileToken.trim() } : {}),
     }),
   });
   return readJsonResponse<PlatformLoginResponse>(response, '登录失败');

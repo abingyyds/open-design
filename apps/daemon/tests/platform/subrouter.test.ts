@@ -123,6 +123,35 @@ describe('SubrouterPlatform Codex runtime', () => {
     fetchMock.mockRestore();
   });
 
+  it('forwards an optional Turnstile token to SubRouter login', async () => {
+    const service = createPlatformUser();
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: true,
+        data: { id: 'external-1', username: 'alice' },
+      }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'set-cookie': 'session=abc; Path=/; HttpOnly',
+        },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ notFound: true }), { status: 404 }));
+
+    await service.loginSubrouter(
+      'https://subrouter.example.com',
+      'alice',
+      'password',
+      undefined,
+      'captcha-token',
+    );
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      'https://subrouter.example.com/api/user/login?turnstile=captcha-token',
+    );
+    fetchMock.mockRestore();
+  });
+
   it('enriches distributor login data with the host required by site model routing', async () => {
     const service = createPlatformUser();
     const fetchMock = vi.spyOn(globalThis, 'fetch')
