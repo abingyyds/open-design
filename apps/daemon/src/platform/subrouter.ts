@@ -667,7 +667,7 @@ export class SubrouterPlatform {
         ?? loginRoot.require2fa;
       if (requiresTwoFactor === true) {
         if (!twoFactorCode) {
-          throw new PlatformError('该 SubRouter 账号启用了双重验证，请输入验证码后继续', 401, 'TWO_FACTOR_REQUIRED');
+          throw new PlatformError('该账号启用了双重验证，请输入验证码后继续', 401, 'TWO_FACTOR_REQUIRED');
         }
         if (!initialCookie) {
           throw new PlatformError('双重验证会话已失效，请重新登录', 401, 'TWO_FACTOR_SESSION_EXPIRED');

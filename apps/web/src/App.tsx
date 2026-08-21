@@ -2786,7 +2786,7 @@ function platformAccountLabel(user: PlatformUser | null): string {
   const account = user?.account;
   const siteName = account?.siteName?.trim();
   if (siteName) return siteName;
-  return 'SubRouter';
+  return '模型账号';
 }
 
 function PlatformAccountBar({
@@ -2816,7 +2816,7 @@ function PlatformAccountBar({
         <label className="platform-account-bar__model">
           <span>选择模型</span>
           <select
-            aria-label="选择 SubRouter 模型"
+            aria-label="选择模型"
             value={selectedModel}
             disabled={savingModel || models.length === 0}
             onChange={(event) => onModelChange(event.target.value)}
