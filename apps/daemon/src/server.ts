@@ -601,6 +601,8 @@ import {
   platformSessionMiddleware,
   registerSubrouterPlatformRoutes,
 } from './platform/subrouter.js';
+import { hostedMaintenanceRequired } from './platform/deployment.js';
+import { startHostedMaintenanceServer } from './platform/hosted-maintenance.js';
 import { createOpenDesignPublicMetadataService } from './services/open-design-public-metadata.js';
 
 /** @typedef {import('@open-design/contracts').ApiErrorCode} ApiErrorCode */
@@ -3345,6 +3347,12 @@ export async function startServer({
   runtime = null,
 }: StartServerOptions = {}) {
   host = normalizeDaemonBindHost(host);
+  if (hostedMaintenanceRequired()) {
+    const maintenance = await startHostedMaintenanceServer(port, host);
+    if (returnServer) return maintenance;
+    console.log(`[od] hosted maintenance listening on ${maintenance.url}`);
+    return maintenance.url;
+  }
   let resolvedPort = port;
   let daemonShuttingDown = false;
   const extraAllowedOrigins = configuredAllowedOrigins();

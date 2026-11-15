@@ -21,3 +21,9 @@ export function hostedPlatformEnabled(env: NodeJS.ProcessEnv = process.env): boo
   if (falsey(env.OD_PLATFORM_ENABLED)) return false;
   return Boolean(env.RAILWAY_ENVIRONMENT || env.RAILWAY_PROJECT_ID);
 }
+
+export function hostedMaintenanceRequired(env: NodeJS.ProcessEnv = process.env): boolean {
+  // The hosted daemon shares an OS identity with project processes. Keep
+  // Railway in maintenance even if an old platform override is present.
+  return hostedPlatformEnabled(env) || Boolean(env.RAILWAY_ENVIRONMENT || env.RAILWAY_PROJECT_ID);
+}

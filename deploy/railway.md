@@ -1,6 +1,10 @@
 # Railway deployment
 
-This build is configured for SubRouter platform mode on Railway.
+Railway deployments currently serve a security maintenance page. The daemon
+keeps `/api/health` available for Railway and returns HTTP 503 for application
+requests. It does not open the platform credential database or start task and
+terminal services. Keep the existing volume attached so data is available for
+incident review.
 
 ## Required variables
 
@@ -9,8 +13,6 @@ NODE_ENV=production
 OD_BIND_HOST=0.0.0.0
 OD_DATA_DIR=/data
 OD_PLATFORM_ENABLED=1
-OD_DISABLE_API_AUTH=1
-OD_CODEX_SANDBOX=danger-full-access
 SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
 OD_SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
 OD_SUBROUTER_GATEWAY_BASE_URL=https://api.subrouter.com
@@ -45,6 +47,6 @@ directories, projects, uploads, and runtime state under this path.
 3. Keep the root directory as the repository root.
 4. Railway will use `railway.toml` and `deploy/Dockerfile`.
 5. Add the variables above.
-6. Add one Volume mounted to `/data`.
-7. Deploy, open the generated domain, sign in with a SubRouter account, and
-   choose a model from the account bar.
+6. Keep the existing volume mounted.
+7. Deploy and verify that `/api/health` returns `ok: true` and
+   `maintenance: true`, and that the public home page returns HTTP 503.

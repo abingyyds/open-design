@@ -1,11 +1,13 @@
 import type { Server } from 'node:http';
 
+import { hostedMaintenanceRequired } from './platform/deployment.js';
+import { startHostedMaintenanceServer } from './platform/hosted-maintenance.js';
 import type { StartServerOptions } from './server.js';
 
 type StartedServer = {
   server: Server;
   url: string;
-  shutdown?: () => Promise<void>;
+  shutdown?: () => Promise<void> | void;
 };
 
 export type StartedDaemonRuntime = StartedServer & {
@@ -117,20 +119,21 @@ export async function closeHttpServer(
 
 export async function startDaemonRuntime(options: DaemonRuntimeOptions = {}): Promise<StartedDaemonRuntime> {
   const { openBrowser: shouldOpenBrowser = false, logListening = false, ...serverOptions } = options;
-  const { startServer } = await import('./server.js');
-  const started = await startServer({
-    ...serverOptions,
-    returnServer: true,
-  }) as string | StartedServer;
+  const started: string | StartedServer = hostedMaintenanceRequired()
+    ? await startHostedMaintenanceServer(
+        serverOptions.port ?? 7456,
+        normalizeDaemonBindHost(serverOptions.host ?? process.env.OD_BIND_HOST),
+      )
+    : await (await import('./server.js')).startServer({ ...serverOptions, returnServer: true }) as string | StartedServer;
   if (typeof started === 'string') {
     throw new Error('daemon startServer did not return a server handle');
   }
 
   const stop = async () => {
     const closePromise = closeHttpServer(started.server);
-    const shutdownPromise = started.shutdown?.().catch((error: unknown) => {
+    const shutdownPromise = Promise.resolve().then(() => started.shutdown?.()).catch((error: unknown) => {
       console.error('daemon shutdown cleanup failed', error);
-    }) ?? Promise.resolve();
+    });
     await Promise.allSettled([shutdownPromise, closePromise]);
   };
 
