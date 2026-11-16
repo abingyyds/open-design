@@ -17,27 +17,13 @@ export type PlatformUser = {
   account?: PlatformAccount;
 };
 
-export type PlatformModel = {
-  id: string;
-  name?: string;
-  label?: string;
-  description?: string;
-};
-
 export type PlatformStatus = {
   enabled: boolean;
   authenticated: boolean;
   user: PlatformUser | null;
 };
 
-export type PlatformModelsResponse = {
-  models: PlatformModel[];
-  defaultModel: string;
-};
-
-export type PlatformLoginResponse = PlatformModelsResponse & {
-  user: PlatformUser;
-};
+export type PlatformLoginResponse = { user: PlatformUser };
 
 export class PlatformApiError extends Error {
   code: string;
@@ -84,14 +70,6 @@ export async function fetchPlatformStatus(): Promise<PlatformStatus> {
   return readJsonResponse<PlatformStatus>(response, '平台状态读取失败');
 }
 
-export async function fetchPlatformModels(): Promise<PlatformModelsResponse> {
-  const response = await fetch('/api/platform/models', {
-    cache: 'no-store',
-    credentials: 'include',
-  });
-  return readJsonResponse<PlatformModelsResponse>(response, '模型列表读取失败');
-}
-
 export async function loginPlatform(
   username: string,
   password: string,
@@ -117,14 +95,4 @@ export async function logoutPlatform(): Promise<void> {
     method: 'POST',
     credentials: 'include',
   }).catch(() => {});
-}
-
-export async function setPlatformModel(model: string): Promise<{ ok: true; defaultModel: string }> {
-  const response = await fetch('/api/platform/model', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify({ model }),
-  });
-  return readJsonResponse<{ ok: true; defaultModel: string }>(response, '模型保存失败');
 }

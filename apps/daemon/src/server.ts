@@ -3807,9 +3807,11 @@ export async function startServer({
     appConfig: { readAppConfig },
   });
 
-  registerAutomationRoutes(app, {
-    paths: { RUNTIME_DATA_DIR },
-  });
+  if (!subrouterPlatform.enabled) {
+    registerAutomationRoutes(app, {
+      paths: { RUNTIME_DATA_DIR },
+    });
+  }
 
   // Reconcile follow-up — the inline POST /api/projects body that lived
   // on garnet (with baseDir privilege check, linkedDirs validation,
@@ -4435,23 +4437,25 @@ export async function startServer({
     deploy: deployDeps,
     projectStore: projectStoreDeps,
   });
-  registerFinalizeRoutes(app, {
-    db,
-    http: httpDeps,
-    paths: pathDeps,
-    projectStore: projectStoreDeps,
-    validation: validationDeps,
-    finalize: finalizeDeps,
-  });
-  registerHandoffRoutes(app, {
-    db,
-    http: httpDeps,
-    paths: pathDeps,
-    projectStore: projectStoreDeps,
-    conversations: conversationDeps,
-    validation: validationDeps,
-    handoff: handoffDeps,
-  });
+  if (!subrouterPlatform.enabled) {
+    registerFinalizeRoutes(app, {
+      db,
+      http: httpDeps,
+      paths: pathDeps,
+      projectStore: projectStoreDeps,
+      validation: validationDeps,
+      finalize: finalizeDeps,
+    });
+    registerHandoffRoutes(app, {
+      db,
+      http: httpDeps,
+      paths: pathDeps,
+      projectStore: projectStoreDeps,
+      conversations: conversationDeps,
+      validation: validationDeps,
+      handoff: handoffDeps,
+    });
+  }
   registerDeploymentCheckRoutes(app, { db, http: httpDeps, deploy: deployDeps, platform: subrouterPlatform });
   app.use('/frames', express.static(FRAMES_DIR));
   registerProjectExportRoutes(app, {
@@ -4761,11 +4765,13 @@ export async function startServer({
     assembleExample,
   });
 
-  registerGenuiRoutes(app, {
-    db,
-    design,
-    paths: { PROJECTS_DIR },
-  });
+  if (!subrouterPlatform.enabled) {
+    registerGenuiRoutes(app, {
+      db,
+      design,
+      paths: { PROJECTS_DIR },
+    });
+  }
 
   registerProjectPluginRoutes(app, {
     platform: subrouterPlatform,
@@ -5447,10 +5453,9 @@ export async function startServer({
   };
 
   const startChatRun = async (chatBody, run) => {
-    // Hosted runs require the separate worker and credential transport. The
-    // local daemon pipeline may spawn plugins, commands and other host tools.
+    // The local daemon pipeline may spawn plugins, commands and other host tools.
     if (subrouterPlatform.enabled) {
-      return design.runs.fail(run, 'AGENT_EXECUTION_FAILED', 'Hosted tasks are in security maintenance.');
+      return design.runs.fail(run, 'AGENT_EXECUTION_FAILED', 'Agent runs are disabled on hosted Open Design.');
     }
     run.analyticsTelemetry = {
       ...(run.analyticsTelemetry ?? {}),

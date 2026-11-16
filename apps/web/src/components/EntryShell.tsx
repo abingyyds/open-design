@@ -327,7 +327,7 @@ interface Props {
   // instead of hiding it during the seconds AMR's probe takes to settle.
   agentsLoading?: boolean;
   daemonLive: boolean;
-  /** Hosted platform mode — see InlineModelSwitcher.platformMode. */
+  /** Hosted platform mode does not expose local model selection. */
   platformMode?: boolean;
   onModeChange: (mode: ExecMode) => void;
   onAgentChange: (id: string) => void;
@@ -722,14 +722,13 @@ export function EntryShell({
     );
   }
 
-  const executionSwitcher = (
+  const executionSwitcher = platformMode ? null : (
     <InlineModelSwitcher
       config={config}
       agents={agents}
       providerModelsCache={activeProviderModelsCache}
       onProviderModelsCacheChange={activeSetProviderModelsCache}
       daemonLive={daemonLive}
-      platformMode={platformMode}
       onModeChange={onModeChange}
       onAgentChange={onAgentChange}
       onAgentModelChange={onAgentModelChange}
@@ -738,7 +737,7 @@ export function EntryShell({
       onOpenSettings={onOpenSettings}
     />
   );
-  const homeExecutionSwitcher = (
+  const homeExecutionSwitcher = platformMode ? null : (
     <InlineModelSwitcher
       compact
       config={config}
@@ -746,7 +745,6 @@ export function EntryShell({
       providerModelsCache={activeProviderModelsCache}
       onProviderModelsCacheChange={activeSetProviderModelsCache}
       daemonLive={daemonLive}
-      platformMode={platformMode}
       onModeChange={onModeChange}
       onAgentChange={onAgentChange}
       onAgentModelChange={onAgentModelChange}

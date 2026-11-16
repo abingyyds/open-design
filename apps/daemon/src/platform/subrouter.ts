@@ -710,21 +710,7 @@ export class SubrouterPlatform {
   async prepareAccount(login: Record<string, unknown>, fallbackUsername: string) {
     const seed = String(login.external_user_id || login.email || login.username || fallbackUsername);
     const userId = `sr_${sha256(`subrouterai:${seed}`).slice(0, 24)}`;
-    const key = await this.ensureSubrouterKey(login);
-    // Codex is the platform runtime.  Keep image/video catalogue entries out
-    // of the account picker so a user cannot select a media-only model and
-    // then receive an opaque Codex failure on the first run.
-    const models = codexResponsesModels(await this.fetchModelsForLogin(login, key.key), this.env);
     const existing = this.rowForUser(userId);
-    const modelIds = new Set(models.map((model) => model.id));
-    const defaultModel =
-      modelIds.size === 0
-        ? isCodexResponsesModel(String(existing?.default_model || ''), this.env)
-          ? String(existing?.default_model || '')
-          : ''
-        : existing?.default_model && modelIds.has(existing.default_model)
-          ? existing.default_model
-          : pickDefaultModel(models);
     const dist = login.distributor && typeof login.distributor === 'object'
       ? login.distributor as Record<string, string>
       : {};
@@ -738,17 +724,14 @@ export class SubrouterPlatform {
       username,
       email: String(login.email || ''),
       display_name: String(login.display_name || login.username || fallbackUsername),
-      subrouter_api_key: key.key,
       subrouter_base_url: normalizeBaseUrl(String(login.base_url || '')),
       subrouter_external_user_id: String(login.external_user_id || ''),
       subrouter_session_cookie: String(login.session_cookie || ''),
       subrouter_access_token: normalizeAccessToken(login.access_token),
-      subrouter_api_key_id: key.id || '',
       subrouter_distributor_id: dist.id || '',
       subrouter_distributor_slug: dist.slug || '',
       subrouter_distributor_name: dist.name || '',
       subrouter_distributor_domain: dist.domain || '',
-      default_model: defaultModel,
       updated_at: timestamp,
     };
     if (existing) {
@@ -757,17 +740,14 @@ export class SubrouterPlatform {
            SET username = @username,
                email = @email,
                display_name = @display_name,
-               subrouter_api_key = @subrouter_api_key,
                subrouter_base_url = @subrouter_base_url,
                subrouter_external_user_id = @subrouter_external_user_id,
                subrouter_session_cookie = @subrouter_session_cookie,
                subrouter_access_token = @subrouter_access_token,
-               subrouter_api_key_id = @subrouter_api_key_id,
                subrouter_distributor_id = @subrouter_distributor_id,
                subrouter_distributor_slug = @subrouter_distributor_slug,
                subrouter_distributor_name = @subrouter_distributor_name,
                subrouter_distributor_domain = @subrouter_distributor_domain,
-               default_model = @default_model,
                updated_at = @updated_at
          WHERE id = @id
       `).run(common);
@@ -779,14 +759,14 @@ export class SubrouterPlatform {
           subrouter_distributor_id, subrouter_distributor_slug, subrouter_distributor_name,
           subrouter_distributor_domain, default_model, created_at, updated_at
         ) VALUES (
-          @id, @username, @email, @display_name, @subrouter_api_key, @subrouter_base_url,
-          @subrouter_external_user_id, @subrouter_session_cookie, @subrouter_access_token, @subrouter_api_key_id,
+          @id, @username, @email, @display_name, '', @subrouter_base_url,
+          @subrouter_external_user_id, @subrouter_session_cookie, @subrouter_access_token, '',
           @subrouter_distributor_id, @subrouter_distributor_slug, @subrouter_distributor_name,
-          @subrouter_distributor_domain, @default_model, @created_at, @updated_at
+          @subrouter_distributor_domain, '', @created_at, @updated_at
         )
       `).run({ ...common, created_at: timestamp });
     }
-    return { user: this.publicUser(this.rowForUser(userId)), models, defaultModel };
+    return { user: this.publicUser(this.rowForUser(userId)), models: [], defaultModel: '' };
   }
 
   uniqueUsername(username: string, userId: string): string {
@@ -1239,40 +1219,19 @@ export function registerSubrouterPlatformRoutes(app: Express, platform: Subroute
     res.json({ ok: true });
   });
 
-  app.get('/api/platform/models', async (req, res) => {
-    try {
-      platform.attachSession(req);
-      const user = platform.currentUser(req);
-      if (!user) {
-        return res.status(401).json({ error: { code: 'PLATFORM_LOGIN_REQUIRED', message: '请先登录平台账号' } });
-      }
-      const result = await platform.fetchModels(user.id);
-      res.json({ models: result.models, defaultModel: result.defaultModel });
-    } catch (error) {
-      sendPlatformError(res, error);
+  app.get('/api/platform/models', (req, res) => {
+    platform.attachSession(req);
+    if (!platform.currentUser(req)) {
+      return res.status(401).json({ error: { code: 'PLATFORM_LOGIN_REQUIRED', message: '请先登录平台账号' } });
     }
+    res.json({ models: [], defaultModel: '' });
   });
 
-  app.post('/api/platform/model', async (req, res) => {
-    try {
-      platform.attachSession(req);
-      const user = platform.currentUser(req);
-      if (!user) {
-        return res.status(401).json({ error: { code: 'PLATFORM_LOGIN_REQUIRED', message: '请先登录平台账号' } });
-      }
-      const model = String(req.body?.model || '').trim();
-      if (!model) throw new PlatformError('请选择模型');
-      const available = await platform.fetchModels(user.id);
-      if (available.models.length === 0) {
-        throw new PlatformError('暂时无法读取可用模型，请稍后刷新重试', 503, 'MODELS_UNAVAILABLE');
-      }
-      if (!available.models.some((candidate) => candidate.id === model)) {
-        throw new PlatformError('所选模型当前不可用，请刷新模型列表后重试', 409, 'MODEL_UNAVAILABLE');
-      }
-      platform.setDefaultModel(user.id, model);
-      res.json({ ok: true, defaultModel: model });
-    } catch (error) {
-      sendPlatformError(res, error);
+  app.post('/api/platform/model', (req, res) => {
+    platform.attachSession(req);
+    if (!platform.currentUser(req)) {
+      return res.status(401).json({ error: { code: 'PLATFORM_LOGIN_REQUIRED', message: '请先登录平台账号' } });
     }
+    sendPlatformError(res, new PlatformError('Agent runs are disabled on hosted Open Design.', 403, 'FORBIDDEN'));
   });
 }

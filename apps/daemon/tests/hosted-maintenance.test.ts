@@ -11,12 +11,14 @@ afterEach(() => {
 
 describe('hosted security maintenance', () => {
   it.each([
-    { name: 'explicit hosted mode', platform: '1', railway: undefined },
-    { name: 'Railway with a legacy platform override', platform: '0', railway: 'test-environment' },
-  ])('keeps $name in maintenance without opening the platform database', async ({ platform, railway }) => {
+    { name: 'explicit hosted mode', platform: '1', railway: undefined, override: undefined },
+    { name: 'Railway with a legacy platform override', platform: '0', railway: 'test-environment', override: undefined },
+    { name: 'Railway without tenant auth even when maintenance is disabled', platform: '0', railway: 'test-environment', override: '0' },
+  ])('keeps $name in maintenance without opening the platform database', async ({ platform, railway, override }) => {
     vi.stubEnv('OD_PLATFORM_ENABLED', platform);
     vi.stubEnv('RAILWAY_ENVIRONMENT', railway);
     vi.stubEnv('RAILWAY_PROJECT_ID', undefined);
+    vi.stubEnv('OD_HOSTED_MAINTENANCE', override);
     vi.stubEnv('OD_DISABLE_API_AUTH', '1');
     vi.stubEnv('OD_CODEX_SANDBOX', 'danger-full-access');
     const runtime = await startDaemonRuntime({ host: '127.0.0.1', port: 0 });
@@ -47,6 +49,7 @@ describe('hosted security maintenance', () => {
 
   it('uses the maintenance listener when the server is started directly', async () => {
     vi.stubEnv('OD_PLATFORM_ENABLED', '1');
+    vi.stubEnv('OD_HOSTED_MAINTENANCE', '1');
     const { startServer } = await import('../src/server.js');
     const started = await startServer({
       host: '127.0.0.1', port: 0, returnServer: true,

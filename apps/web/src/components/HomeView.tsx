@@ -7,7 +7,7 @@
 // surface by lifting its plugin orchestration up here so the prompt
 // textarea can live centered in the hero.
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Dialog, DialogFooter, DialogTitle } from '@open-design/components';
 import type {
   ApplyResult,
@@ -50,6 +50,7 @@ import {
   localizeSkillName,
   localizeSkillPrompt,
 } from '../i18n/content';
+import { HostedPlatformContext } from '../providers/platform';
 import { fetchElevenLabsVoiceOptions } from '../providers/elevenlabs-voices';
 import { IMAGE_MODELS } from '../media/models';
 import {
@@ -252,6 +253,7 @@ export function HomeView({
   promptTemplates = EMPTY_PROMPT_TEMPLATES,
   executionSwitcher,
 }: Props) {
+  const hosted = useContext(HostedPlatformContext);
   const { locale, t } = useI18n();
   const analytics = useAnalytics();
   // P0 page_view page_name=home — fire once on mount. ref-keyed to survive
@@ -1547,7 +1549,7 @@ export function HomeView({
   // seed its text, then defer the create to submit() (which resolves the
   // snapshot and builds the same payload the manual flow does).
   function submitScenario(scenario: PlaceholderScenario) {
-    if (sending) return;
+    if (hosted || sending) return;
     setError(null);
     if (pluginsLoading) return;
     const chip = scenario.chipId ? findChip(scenario.chipId) : null;
@@ -1592,7 +1594,7 @@ export function HomeView({
   async function submit() {
     // The send button disables itself while sending, but the Enter-to-send
     // path lands here directly — swallow re-entry during the in-flight window.
-    if (sending) return;
+    if (hosted || sending) return;
     const trimmed = prompt.trim();
     if (!trimmed && stagedFiles.length === 0) return;
     // P0 ui_click area=chat_composer element=send_button. Fires before the
@@ -1763,7 +1765,7 @@ export function HomeView({
 
   return (
     <div className="home-view" data-testid="home-view" ref={homeViewRef}>
-      <HomeHero
+      {!hosted ? <HomeHero
         ref={inputRef}
         active={isActive}
         firstRunGuide={projectsLoading ? undefined : projects.length === 0}
@@ -1851,7 +1853,7 @@ export function HomeView({
         sessionMode={sessionMode}
         onSessionModeChange={setSessionMode}
         executionSwitcher={executionSwitcher}
-      />
+      /> : null}
 
       <RecentProjectsStrip
         projects={projects}

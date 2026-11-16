@@ -19,11 +19,11 @@ export function hostedPlatformEnabled(env: NodeJS.ProcessEnv = process.env): boo
   const explicit = env.OD_PLATFORM_ENABLED ?? env.OPEN_DESIGN_PLATFORM_ENABLED;
   if (explicit !== undefined) return truthy(explicit);
   if (falsey(env.OD_PLATFORM_ENABLED)) return false;
-  return Boolean(env.RAILWAY_ENVIRONMENT || env.RAILWAY_PROJECT_ID);
+  return Boolean(env.RAILWAY_ENVIRONMENT || env.RAILWAY_ENVIRONMENT_ID || env.RAILWAY_PROJECT_ID);
 }
 
 export function hostedMaintenanceRequired(env: NodeJS.ProcessEnv = process.env): boolean {
-  // The hosted daemon shares an OS identity with project processes. Keep
-  // Railway in maintenance even if an old platform override is present.
-  return hostedPlatformEnabled(env) || Boolean(env.RAILWAY_ENVIRONMENT || env.RAILWAY_PROJECT_ID);
+  const railway = Boolean(env.RAILWAY_ENVIRONMENT || env.RAILWAY_ENVIRONMENT_ID || env.RAILWAY_PROJECT_ID);
+  if (!hostedPlatformEnabled(env)) return railway;
+  return env.OD_HOSTED_MAINTENANCE?.trim() !== '0';
 }

@@ -166,19 +166,8 @@
   gap: 10px;
 }
 
-.platform-account-bar__model {
-  min-width: 180px;
-  display: grid;
-  grid-template-columns: auto minmax(120px, 280px);
-  align-items: center;
-  gap: 8px;
+.platform-account-bar__notice {
   color: var(--text-muted);
-  font-size: 12px;
-}
-
-.platform-account-bar select {
-  height: 30px;
-  padding: 0 28px 0 10px;
   font-size: 12px;
 }
 
@@ -206,12 +195,7 @@
     padding: 8px 10px;
   }
 
-  .platform-account-bar__controls,
-  .platform-account-bar__model {
+  .platform-account-bar__controls {
     width: 100%;
-  }
-
-  .platform-account-bar__model {
-    grid-template-columns: auto minmax(0, 1fr);
   }
 }

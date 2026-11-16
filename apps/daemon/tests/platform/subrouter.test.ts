@@ -40,6 +40,25 @@ describe('SubrouterPlatform Codex runtime', () => {
     return platform;
   }
 
+  it('prepares a hosted login without provisioning or refreshing a model key', async () => {
+    const service = createPlatformUser();
+    const provision = vi.spyOn(service, 'ensureSubrouterKey');
+    const login = { external_user_id: 'fixture-id', username: 'fixture-user', base_url: 'https://subrouter.example.com' };
+    const first = await service.prepareAccount(login, 'fixture-user');
+    expect(first).toMatchObject({
+      user: { username: 'fixture-user', account: { configured: false } },
+      models: [], defaultModel: '',
+    });
+    const existing = { key: 'fixture-existing-key', id: 'fixture-existing-key-id', model: 'gpt-5.4' };
+    service.db.prepare('UPDATE platform_users SET subrouter_api_key = ?, subrouter_api_key_id = ?, default_model = ? WHERE id = ?')
+      .run(existing.key, existing.id, existing.model, first.user!.id);
+    const returning = await service.prepareAccount(login, 'fixture-user');
+    expect(returning.user?.id).toBe(first.user?.id);
+    expect(service.db.prepare('SELECT subrouter_api_key AS key, subrouter_api_key_id AS id, default_model AS model FROM platform_users WHERE id = ?')
+      .get(first.user!.id)).toEqual(existing);
+    expect(provision).not.toHaveBeenCalled();
+  });
+
   it('resolves the selected model without creating a task home on the daemon', () => {
     const service = createPlatformUser();
     expect(service.modelForUser('sr_platform_user')).toBe('gpt-5.4');

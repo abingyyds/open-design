@@ -31,7 +31,7 @@ import {
   readCodexRolloutFirstCall,
 } from '../codex-rollout-usage.js';
 import type { ConnectorService } from '../connectors/service.js';
-import { getConversation, getProject, listConversations, listMessages, updateProject, upsertMessage } from '../db.js';
+import { getProject, listConversations, updateProject, upsertMessage } from '../db.js';
 import { readVelaLoginStatus } from '../integrations/vela.js';
 import {
   deriveLangfuseDeliveryState,
@@ -44,16 +44,11 @@ import {
   getInstalledPlugin,
   resolvePluginSnapshot,
 } from '../plugins/index.js';
-import { collectHostedFiles } from '../platform/hosted-task-files.js';
-import { hostedProjectDirectory, publishHostedArtifacts } from '../platform/hosted-task-project.js';
 import type { SubrouterPlatform } from '../platform/subrouter.js';
 import {
   assertSandboxProjectRootAvailable,
-  hasExternalProjectRoot,
   isSafeId,
-  kindFor,
   listFiles,
-  mimeFor,
   resolveProjectDir,
   SandboxImportedProjectError,
 } from '../projects.js';
@@ -81,7 +76,6 @@ import {
   parseRunToolBundleForRequest,
   validateRunToolBundleForAgent,
 } from '../run-tool-bundle.js';
-import { createJsonEventStreamHandler } from '../runtimes/json-event-stream.js';
 import type { DetectedAgent, RuntimeAgentDef } from '../runtimes/types.js';
 import {
   countDesignSystemPreviewModules,
@@ -468,153 +462,6 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     return platform?.enabled ? platform.currentUser?.(req) ?? null : null;
   }
 
-  function queueHostedRun(req: ApiRequest, res: ApiResponse, stream: boolean) {
-    if (!platform?.enabled) throw new Error('Hosted platform is unavailable');
-    const body = toJsonRecord(req.body);
-    const user = platformUser(req);
-    if (!user) return sendApiError(res, 401, 'PLATFORM_LOGIN_REQUIRED', '请先登录平台账号');
-
-    const { projectId, message } = body;
-    if (typeof projectId !== 'string' || !isSafeId(projectId)) {
-      return sendApiError(res, 400, 'BAD_REQUEST', 'A managed project is required');
-    }
-    if (typeof message !== 'string' || !message.trim() || Buffer.byteLength(message) > 256 * 1024) {
-      return sendApiError(res, 400, 'BAD_REQUEST', 'A message within the hosted task limit is required');
-    }
-    const project = getProject(db, projectId);
-    if (!platform.projectBelongsToRequest(req, project)) {
-      return sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
-    }
-    if (hasExternalProjectRoot(project?.metadata)) {
-      return sendApiError(res, 403, 'FORBIDDEN', 'Hosted projects must use managed storage');
-    }
-    const conversationId = typeof body.conversationId === 'string' && body.conversationId
-      ? body.conversationId
-      : listConversations(db, projectId)[0]?.id;
-    if (!conversationId || getConversation(db, conversationId)?.projectId !== projectId) {
-      return sendApiError(res, 404, 'NOT_FOUND', 'conversation not found');
-    }
-    const messageId = body.assistantMessageId ?? randomUUID();
-    if (typeof messageId !== 'string' || !isSafeId(messageId)) {
-      return sendApiError(res, 400, 'BAD_REQUEST', 'Invalid assistant message id');
-    }
-    const messageRow = db.prepare('SELECT conversation_id, role, run_id FROM messages WHERE id = ?')
-      .get(messageId) as { conversation_id: string; role: string; run_id: string | null } | undefined;
-    if (messageRow && (messageRow.conversation_id !== conversationId
-      || messageRow.role !== 'assistant' || messageRow.run_id)) {
-      return sendApiError(res, 409, 'CONFLICT', 'The assistant message is unavailable');
-    }
-    const image = process.env.OD_HOSTED_WORKER_IMAGE;
-    if (!image || !/^sha256:[a-f0-9]{64}$/.test(image)) {
-      return sendApiError(res, 503, 'UPSTREAM_UNAVAILABLE', 'Hosted worker is unavailable');
-    }
-    let model: string;
-    try {
-      model = platform.modelForUser(user.id);
-    } catch (error) {
-      const failure = error as { status?: number; code?: string; message?: string };
-      return sendApiError(res, failure.status ?? 503, failure.code ?? 'UPSTREAM_UNAVAILABLE',
-        failure.message ?? 'Hosted model is unavailable');
-    }
-    const history = listMessages(db, conversationId)
-      .filter((entry) => (entry.role === 'user' || entry.role === 'assistant') && entry.content)
-      .slice(-12);
-    if (history.at(-1)?.role === 'user' && history.at(-1)?.content === message) {
-      history.pop();
-    } else {
-      upsertMessage(db, conversationId, {
-        id: randomUUID(), role: 'user', content: message, endedAt: Date.now(),
-      });
-    }
-    const prompt = [
-      'Use the provided project workspace. Save new and edited deliverables there using visible project paths.',
-      ...history.map((entry) => `${entry.role}: ${String(entry.content).slice(0, 8_000)}`),
-      `Current user request:\n${message}`,
-    ].join('\n\n');
-    const run = design.runs.create({
-      projectId, conversationId, assistantMessageId: messageId, agentId: 'codex',
-      clientRequestId: typeof body.clientRequestId === 'string' ? body.clientRequestId : null,
-    });
-    run.model = model;
-    (run as ChatRun & { platformUserId: string }).platformUserId = user.id;
-    const originalProjectTime = project?.createdAt;
-    pinAssistantMessageOnRunCreate(db, run);
-    reconcileAssistantMessageOnRunEnd(db, design.runs, run);
-    if (stream) {
-      design.runs.stream(run, req, res);
-      res.on('close', () => {
-        if (!res.writableEnded) void design.runs.cancel(run);
-      });
-    } else {
-      res.status(202).json({ runId: run.id, conversationId, assistantMessageId: messageId });
-    }
-
-    const assertOwner = () => {
-      const current = getProject(db, projectId);
-      if (!platform?.projectBelongsToRequest(req, current)
-        || current?.createdAt !== originalProjectTime || hasExternalProjectRoot(current?.metadata)
-        || getConversation(db, conversationId)?.projectId !== projectId) {
-        throw new Error('Hosted project is unavailable');
-      }
-    };
-
-    const service = platform;
-    design.runs.start(run, () => {
-      const abort = new AbortController();
-      let text = '';
-      const parser = createJsonEventStreamHandler('codex', (event) => {
-        if (abort.signal.aborted || event.type === 'raw' || event.type === 'error') return;
-        if (event.type === 'text_delta') text += event.delta;
-        design.runs.emit?.(run, 'agent', event);
-      });
-
-      const execute = async () => {
-        try {
-          assertOwner();
-          const dir = await hostedProjectDirectory(PROJECTS_DIR, projectId);
-          const files = await collectHostedFiles(dir, abort.signal);
-          assertOwner();
-          run.status = 'running';
-          design.runs.emit?.(run, 'start', { agentId: 'codex', model });
-          const result = await service.runTaskForRequest(req, {
-            image, prompt, files, signal: abort.signal, onStdout: parser.feed,
-          });
-          parser.flush();
-          abort.signal.throwIfAborted();
-          if (result.code !== 0) throw new Error('Hosted worker failed');
-          assertOwner();
-          const published = await publishHostedArtifacts(dir, files, result.artifacts, assertOwner, abort.signal);
-          const endedAt = Date.now();
-          const pinned = db.prepare('SELECT 1 FROM messages WHERE id = ? AND conversation_id = ? AND run_id = ?')
-            .get(messageId, conversationId, run.id);
-          if (pinned) {
-            upsertMessage(db, conversationId, {
-              id: messageId, role: 'assistant', content: text, agentId: 'codex',
-              runId: run.id, runStatus: 'succeeded', startedAt: run.createdAt, endedAt,
-              producedFiles: published.map((name) => ({
-                name, path: name, size: result.artifacts.get(name)!.length,
-                mtime: endedAt, kind: kindFor(name), mime: mimeFor(name), type: 'file',
-              })),
-            });
-          }
-          design.runs.finish(run, 'succeeded', 0);
-        } catch {
-          if (abort.signal.aborted) design.runs.finish(run, 'canceled', null, 'SIGTERM');
-          else design.runs.fail(run, 'AGENT_EXECUTION_FAILED', 'Hosted task failed');
-        } finally {
-          delete run.cancelTask;
-        }
-      };
-
-      const running = execute();
-      run.cancelTask = async () => {
-        abort.abort();
-        await running;
-      };
-      return running;
-    });
-  }
-
   function projectVisibleForRequest(req: Request, project: ProjectRecord | null): boolean {
     if (!platform?.enabled) return true;
     return platform.projectBelongsToRequest?.(req, project) === true;
@@ -653,7 +500,9 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     if (ctx.lifecycle.isDaemonShuttingDown()) {
       return sendApiError(res, 503, 'UPSTREAM_UNAVAILABLE', 'daemon is shutting down');
     }
-    if (platform?.enabled) return queueHostedRun(req, res, false);
+    if (platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Agent runs are disabled on hosted Open Design.');
+    }
     const requestBody = toJsonRecord(req.body);
     const mediaExecution = parseMediaExecutionPolicyInput(requestBody.mediaExecution);
     if (!mediaExecution.ok) {
@@ -1582,7 +1431,9 @@ export function registerRunRoutes(app: Express, ctx: RegisterRunRoutesDeps) {
     if (ctx.lifecycle.isDaemonShuttingDown()) {
       return sendApiError(res, 503, 'UPSTREAM_UNAVAILABLE', 'daemon is shutting down');
     }
-    if (platform?.enabled) return queueHostedRun(req, res, true);
+    if (platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Agent runs are disabled on hosted Open Design.');
+    }
     const requestBody = toJsonRecord(req.body);
     const mediaExecution = parseMediaExecutionPolicyInput(requestBody.mediaExecution);
     if (!mediaExecution.ok) {

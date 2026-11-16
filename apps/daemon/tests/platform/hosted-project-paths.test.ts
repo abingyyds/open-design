@@ -28,13 +28,6 @@ import { SubrouterPlatform } from '../../src/platform/subrouter.js';
 import { resolveProjectDir } from '../../src/projects.js';
 import type { StartServerResult } from '../../src/server.js';
 
-// Exercise the production routes on loopback behind real platform sessions.
-// Only the startup maintenance gate is lifted, within this test file.
-vi.mock(import('../../src/platform/deployment.js'), async (importOriginal) => ({
-  ...(await importOriginal()),
-  hostedMaintenanceRequired: () => false,
-}));
-
 describe('hosted project and daemon boundaries', () => {
   const dataDir = process.env.OD_DATA_DIR!;
   const privateDir = path.join(dataDir, 'private-fixture');
@@ -60,6 +53,7 @@ describe('hosted project and daemon boundaries', () => {
 
   beforeAll(async () => {
     vi.stubEnv('OD_PLATFORM_ENABLED', '1');
+    vi.stubEnv('OD_HOSTED_MAINTENANCE', '0');
     vi.stubEnv('OD_MEDIA_CONFIG_DIR', undefined);
     vi.stubEnv('OD_USER_STATE_DIR', deploymentDir);
     const platform = new SubrouterPlatform(dataDir);
@@ -171,6 +165,51 @@ describe('hosted project and daemon boundaries', () => {
       session, headers: { Origin: 'null', 'Sec-Fetch-Dest': dest },
     });
   }
+
+  it('keeps automation storage and actions unavailable to both authenticated tenants', async () => {
+    const surfaces = [
+      ['GET', '/api/automation-source-packets'],
+      ['GET', '/api/automation-source-packets/fixture'],
+      ['POST', '/api/automation-ingestions'],
+      ['GET', '/api/automation-proposals'],
+      ['POST', '/api/automation-proposals'],
+      ['GET', '/api/automation-proposals/fixture'],
+      ['POST', '/api/automation-proposals/fixture/apply'],
+      ['POST', '/api/automation-proposals/fixture/reject'],
+      ['GET', '/api/automation-templates'],
+      ['GET', '/api/automation-templates/fixture'],
+    ] as const;
+    for (const session of [ownerSession, otherSession]) {
+      const account = await request('/api/platform/status', { session });
+      await expect(account.json()).resolves.toMatchObject({ enabled: true, authenticated: true });
+      for (const [method, route] of surfaces) {
+        const response = await request(route, { method, session });
+        expect(response.status, `${method} ${route}`).toBe(404);
+      }
+      const routines = await request('/api/routines', { session });
+      expect(routines.status).toBe(409);
+      await expect(routines.json()).resolves.toMatchObject({ error: { code: 'PLATFORM_FEATURE_UNAVAILABLE' } });
+    }
+  });
+
+  it('blocks the auxiliary local generation routes for both authenticated tenants', async () => {
+    for (const [session, projectId] of [[ownerSession, managedId], [otherSession, secondManagedId]] as const) {
+      for (const route of ['/api/provider/models', '/api/test/connection', '/api/proxy/openai/stream']) {
+        const response = await request(route, { method: 'POST', session, body: {} });
+        expect(response.status, route).toBe(403);
+        await expect(response.json()).resolves.toMatchObject({ error: { code: 'FORBIDDEN' } });
+      }
+      for (const [method, route] of [
+        ['GET', '/api/runs/fixture/genui'],
+        ['POST', '/api/runs/fixture/replay'],
+        ['GET', `/api/projects/${projectId}/genui`],
+        ['POST', `/api/projects/${projectId}/handoff`],
+        ['POST', `/api/projects/${projectId}/finalize/openai`],
+      ] as const) {
+        expect((await request(route, { method, session })).status, route).toBe(404);
+      }
+    }
+  });
 
   it('rejects both tenants reading or changing shared app and media settings', async () => {
     await writeAppConfig(dataDir, { agentCliEnv: { codex: { CODEX_BIN: '/fixture/codex' } } });
@@ -778,6 +817,42 @@ describe('hosted project and daemon boundaries', () => {
       expect(exec).not.toHaveBeenCalled();
     } finally {
       exec.mockRestore();
+    }
+  });
+
+  it('disables hosted agent runs for both authenticated users even with a worker image configured', async () => {
+    const previousImage = process.env.OD_HOSTED_WORKER_IMAGE;
+    vi.stubEnv('OD_HOSTED_WORKER_IMAGE', `sha256:${'a'.repeat(64)}`);
+    const runTask = vi.spyOn(SubrouterPlatform.prototype, 'runTaskForRequest');
+    const execAgent = vi.spyOn(invocation, 'execAgentFile');
+    const count = () => db.prepare('SELECT count(*) AS count FROM messages').get();
+    const before = count();
+    try {
+      for (const [session, projectId, conversationId] of [
+        [ownerSession, managedId, ownerConversationId],
+        [otherSession, secondManagedId, otherConversationId],
+      ] as const) {
+        const options = { method: 'POST', session, body: { projectId, conversationId, message: 'fixture' } };
+        for (const route of ['/api/chat', '/api/runs']) {
+          const response = await request(route, options);
+          expect(response.status).toBe(403);
+          await expect(response.json()).resolves.toMatchObject({ error: { code: 'FORBIDDEN' } });
+        }
+        await expect((await request('/api/agents', { session })).json()).resolves.toEqual({ agents: [] });
+        await expect((await request('/api/agents?stream=1', { session })).text()).resolves.toBe('event: done\ndata: {}\n\n');
+        await expect((await request('/api/platform/models', { session })).json()).resolves.toEqual({ models: [], defaultModel: '' });
+        expect((await request('/api/platform/model', {
+          method: 'POST', session, body: { model: 'gpt-5.4' },
+        })).status).toBe(403);
+      }
+      expect((await request('/api/runs', { method: 'POST', session: '' })).status).toBe(401);
+      expect(runTask).not.toHaveBeenCalled();
+      expect(execAgent).not.toHaveBeenCalled();
+      expect(count()).toEqual(before);
+    } finally {
+      runTask.mockRestore();
+      execAgent.mockRestore();
+      vi.stubEnv('OD_HOSTED_WORKER_IMAGE', previousImage);
     }
   });
 

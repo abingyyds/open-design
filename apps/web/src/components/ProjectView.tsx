@@ -1283,7 +1283,7 @@ export function ProjectView({
     currentConversationHasActiveRun
     && !currentConversationStreaming
     && !currentConversationHasProgrammaticBrandExtractionRun;
-  const currentConversationSendDisabled = currentConversationLoading
+  const currentConversationSendDisabled = platformMode || currentConversationLoading
     || failedMessagesConversationId === activeConversationId
     || currentConversationAwaitingActiveRunAttach;
   const currentConversationActionDisabled = currentConversationBusy || currentConversationSendDisabled;
@@ -3699,7 +3699,7 @@ export function ProjectView({
       meta?: ProjectChatSendMeta,
       baseMessages?: ChatMessage[],
     ) => {
-      if (!activeConversationId) return false;
+      if (platformMode || !activeConversationId) return false;
       if (messagesConversationIdRef.current !== activeConversationId) return false;
       const runSessionMode = meta?.sessionMode ?? activeSessionMode;
       const retryTarget = meta?.retryOfAssistantId
@@ -4612,6 +4612,7 @@ export function ProjectView({
       activeSessionMode,
       currentConversationBusy,
       queueChatSendForCurrentConversation,
+      platformMode,
       messages,
       config,
       locale,
@@ -6534,8 +6535,8 @@ export function ProjectView({
               onDetachComment={detachPreviewComment}
               onDeleteComment={(commentId) => void removePreviewComment(commentId)}
               onSend={handleSend}
-              onRetry={handleRetry}
-              onResumeRun={handleResumeRun}
+              onRetry={platformMode ? undefined : handleRetry}
+              onResumeRun={platformMode ? undefined : handleResumeRun}
               onStop={handleStop}
               onRemoveQueuedSend={removeQueuedChatSend}
               onUpdateQueuedSend={updateQueuedChatSend}
@@ -6552,7 +6553,7 @@ export function ProjectView({
               forceStreamingMessageIds={forceStreamingPluginMessageIds}
               initialDraft={chatInitialDraft}
               onOpenQuestions={openQuestionsTab}
-              onContinueRemainingTasks={handleContinueRemainingTasks}
+              onContinueRemainingTasks={platformMode ? undefined : handleContinueRemainingTasks}
               onAssistantFeedback={handleAssistantFeedback}
               onArtifactShare={handleArtifactShare}
               onArtifactDownload={handleArtifactDownload}

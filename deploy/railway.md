@@ -1,10 +1,9 @@
 # Railway deployment
 
-Railway deployments currently serve a security maintenance page. The daemon
-keeps `/api/health` available for Railway and returns HTTP 503 for application
-requests. It does not open the platform credential database or start task and
-terminal services. Keep the existing volume attached so data is available for
-incident review.
+Railway deployments start in maintenance by default. In maintenance the
+daemon serves `/api/health` for Railway and returns HTTP 503 for application
+requests. Keep the existing volume attached for project data and incident
+review.
 
 ## Required variables
 
@@ -15,16 +14,13 @@ OD_DATA_DIR=/data
 OD_PLATFORM_ENABLED=1
 SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
 OD_SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
-OD_SUBROUTER_GATEWAY_BASE_URL=https://api.subrouter.com
-OD_SUBROUTER_RESPONSES_MODELS=
 ```
 
-The private Railway URL is used for login and account management. Codex model
-traffic must use the public gateway because Codex requires `/v1/responses`,
-which is not exposed by the current private SubRouter service.
-The platform model picker only exposes OpenAI/Codex-shaped models that are
-compatible with that Responses transport. If a deployment has an additional
-Responses-compatible model id, add it to `OD_SUBROUTER_RESPONSES_MODELS`.
+The private Railway URL is used for account authentication. Hosted
+Open Design disables agent runs, model proxy requests, and automation
+endpoints. Login does not provision model keys. The Railway image skips the
+Codex CLI install. The standard local Docker image retains the CLI and
+automation endpoints.
 
 Railway provides `PORT` automatically. Do not set `OD_PORT` unless you have a
 specific reason to override local runs.
@@ -48,8 +44,13 @@ for the volume and isolated hosted-task data roots.
 4. Railway will use `railway.toml` and `deploy/Dockerfile`.
 5. Add the variables above.
 6. Keep the existing volume mounted.
-7. Deploy and verify that `/api/health` returns `ok: true` and
-   `maintenance: true`, and that the public home page returns HTTP 503.
+7. Deploy in maintenance and verify that `/api/health` reports
+   `maintenance: true` and the home page returns HTTP 503.
+8. Set `OD_HOSTED_MAINTENANCE=0` on the Open Design service to enable
+   authenticated access. Verify that the home page returns HTTP 200 and
+   unauthenticated project API requests return HTTP 401. Railway keeps the
+   maintenance page active if tenant authentication is disabled. Set
+   `OD_HOSTED_MAINTENANCE=1` to restore the maintenance page.
 
 ## Local hosted task isolation check
 
@@ -62,9 +63,6 @@ od_test_image=$(docker image inspect open-design-hosted-worker:local-isolation -
 OD_HOSTED_TEST_IMAGE="$od_test_image" corepack pnpm --filter @open-design/daemon exec vitest run -c vitest.config.ts tests/platform/hosted-task-isolation.test.ts
 ```
 
-The tests use real Codex workers, a local fixture gateway, and synthetic
-credentials. They exercise both the internal Worker boundary and the
-authenticated run and chat routes, including event streaming, file transfer,
-cancellation, and cleanup. The test harness enables the hosted listener on
-loopback and sets `OD_HOSTED_WORKER_IMAGE` to the id of the local fixture image.
-The deployed hosted service continues to start in maintenance mode.
+The standalone test exercises the worker boundary with real Codex workers,
+a local gateway and synthetic credentials. Hosted HTTP requests cannot start
+these workers.

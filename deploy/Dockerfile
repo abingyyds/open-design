@@ -80,8 +80,10 @@ COPY plugins/_official ./plugins/_official
 
 FROM ${RUNTIME_IMAGE}
 
+ARG RAILWAY_ENVIRONMENT_ID
+
 RUN apk add --no-cache tini poppler-utils bash git su-exec && \
-    npm install -g @openai/codex && \
+    if [ -z "$RAILWAY_ENVIRONMENT_ID" ]; then npm install -g @openai/codex; fi && \
     addgroup -S -g 1001 open-design && \
     adduser -S -D -H -u 1001 -G open-design open-design
 

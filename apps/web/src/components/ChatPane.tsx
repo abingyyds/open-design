@@ -2,6 +2,7 @@ import {
   Fragment,
   memo,
   useCallback,
+  useContext,
   useDeferredValue,
   useEffect,
   useLayoutEffect,
@@ -27,6 +28,7 @@ import {
 } from '../runtime/design-toolbox';
 import type { Dict } from '../i18n/types';
 import { copyToClipboard } from '../lib/copy-to-clipboard';
+import { HostedPlatformContext } from '../providers/platform';
 import { projectRawUrl } from '../providers/registry';
 import { takeComposerSeedFor } from '../state/libraryHandoff';
 import type { TodoItem } from '../runtime/todos';
@@ -783,6 +785,7 @@ export function ChatPane({
 }: Props) {
   const t = useT();
   const analytics = useAnalytics();
+  const hosted = useContext(HostedPlatformContext);
   const displayMessages = messages;
   const amrProfile = config?.agentCliEnv?.amr?.[AMR_PROFILE_ENV_KEY] ?? null;
   const [inlineAmrLoginStatus, setInlineAmrLoginStatus] =
@@ -2047,7 +2050,7 @@ export function ChatPane({
               }}
             >
               {loading ? <ChatConversationLoading t={t} /> : null}
-              {displayMessages.length === 0 && !loading ? (
+              {!hosted && displayMessages.length === 0 && !loading ? (
                 <div className="chat-empty-wrap">
                   {showImportedFolderArtifacts ? (
                     <ImportedFolderArtifacts
@@ -2412,7 +2415,7 @@ export function ChatPane({
               <span>{t('chat.jumpToLatest')}</span>
             </button>
           </div>
-          <QueuedSendStrip
+          {!hosted ? <QueuedSendStrip
             containerRef={queuedSendStripRef}
             items={queuedItems}
             editingId={editingQueuedSendId}
@@ -2451,16 +2454,16 @@ export function ChatPane({
                   onSendQueuedNow(id);
                 }
               : undefined}
-          />
-          <div
+          /> : null}
+          {!hosted ? <div
             className="chat-composer-slot"
             ref={composerSlotRef}
             style={composerSlotStyle}
             aria-hidden={shouldPortalComposer ? true : undefined}
           >
             {shouldPortalComposer ? null : composerNode}
-          </div>
-          {shouldPortalComposer && composerPortalTarget && composerPortalRect
+          </div> : null}
+          {!hosted && shouldPortalComposer && composerPortalTarget && composerPortalRect
             ? createPortal(
                 <div
                   className="chat-composer-fixed-layer"

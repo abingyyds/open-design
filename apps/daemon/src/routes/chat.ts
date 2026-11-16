@@ -70,6 +70,12 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
     critiqueResponseCapBytes,
     critiqueRunRegistry,
   } = ctx.critique;
+  if (ctx.platform?.enabled) {
+    app.use(['/api/proxy', '/api/provider/models', '/api/test/connection'], (_req, res) => {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Provider and agent connection tools are unavailable in hosted mode');
+    });
+  }
+
   const rejectProxyPluginContext = (body: Record<string, unknown>, res: any) => {
     if (
       (typeof body.pluginId === 'string' && body.pluginId.trim().length > 0) ||
@@ -312,9 +318,6 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
       }
 
       if (body.mode === 'agent') {
-        if (ctx.platform?.enabled) {
-          return sendApiError(res, 403, 'FORBIDDEN', 'Host agent connection checks are unavailable in hosted mode');
-        }
         if (typeof body.agentId !== 'string' || !body.agentId.trim()) {
           return sendApiError(res, 400, 'BAD_REQUEST', 'agentId is required');
         }

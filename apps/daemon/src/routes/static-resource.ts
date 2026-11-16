@@ -3,7 +3,7 @@ import type Database from 'better-sqlite3';
 import path from 'node:path';
 import fs from 'node:fs';
 import type { DesignSystemTokenContractRebuildJobResponse } from '@open-design/contracts';
-import { detectAgents, detectAgentsStream, getAgentDef } from '../agents.js';
+import { detectAgents, detectAgentsStream } from '../agents.js';
 import {
   SkillImportError,
   deleteUserSkill,
@@ -137,81 +137,15 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
     };
   };
 
-  async function platformCodexAgent(req: any) {
-    if (!platform?.enabled) return null;
-    const user = platform.currentUser?.(req);
-    if (!user) return null;
-    const def: any = getAgentDef('codex');
-    if (!def) return null;
-    const {
-      buildArgs,
-      listModels,
-      fetchModels,
-      fallbackModels: _fallbackModels,
-      helpArgs,
-      capabilityFlags,
-      fallbackBins,
-      versionProbeTimeoutMs,
-      maxPromptArgBytes,
-      env,
-      inactivityTimeoutMs,
-      authProbe,
-      ...rest
-    } = def;
-    let models = [];
-    let runtimeModel = '';
-    try {
-      runtimeModel = platform.modelForUser(user.id);
-      const result = await platform.fetchModels(user.id);
-      models = Array.isArray(result.models)
-        ? result.models
-            .filter((model: any) => !model.type || model.type === 'text')
-            .map((model: any) => ({ id: model.id, label: model.label ?? model.id }))
-            .filter((model: any) => model.id)
-        : [];
-      if (models.length === 0 && runtimeModel) {
-        models = [{ id: runtimeModel, label: runtimeModel }];
-      }
-    } catch {
-      models = [];
-    }
-    // Never expose the Codex package's static OpenAI fallback catalogue in
-    // platform mode. Those models are not necessarily present in the
-    // SubRouter user's subscription and selecting one would fail only after
-    // the run had already started. An empty list is intentional: the UI can
-    // show an unavailable platform runtime and ask the user to refresh/login.
-    return {
-      ...rest,
-      models,
-      modelsSource: 'live',
-      available: models.length > 0,
-      path: 'codex',
-      authStatus: models.length > 0 ? 'authenticated' : 'error',
-    };
-  }
-
   app.get('/api/agents', async (req, res) => {
     const wantsStream =
       req.query.stream === '1' || req.query.stream === 'true';
-    const platformAgent = await platformCodexAgent(req);
-    if (platformAgent) {
-      if (!wantsStream) {
-        res.json({ agents: [platformAgent] });
-        return;
-      }
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache, no-transform',
-        Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      });
-      res.write(`event: agent\ndata: ${JSON.stringify(platformAgent)}\n\n`);
-      res.write('event: done\ndata: {}\n\n');
-      res.end();
-      return;
-    }
     if (platform?.enabled) {
-      res.json({ agents: [] });
+      if (wantsStream) {
+        res.type('text/event-stream').end('event: done\ndata: {}\n\n');
+      } else {
+        res.json({ agents: [] });
+      }
       return;
     }
     let config;

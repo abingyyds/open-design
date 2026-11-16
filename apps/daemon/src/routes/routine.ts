@@ -129,19 +129,17 @@ export function registerRoutineRoutes(app: Express, ctx: RegisterRoutineRoutesDe
   const { db } = ctx;
   const { routineService } = ctx.routines;
 
-  // A scheduled routine has no browser request/session from which to resolve
-  // a SubRouter tenant. Running it with daemon-global credentials would be a
-  // cross-user data/model leak, so hosted platform mode fails closed until
-  // routines gain an explicit per-user scheduler context.
+  // Routine schedules and automation templates use daemon-wide storage.
   if (ctx.platform?.enabled) {
     app.use('/api/routines', (_req, res) => {
       res.status(409).json({
         error: {
           code: 'PLATFORM_FEATURE_UNAVAILABLE',
-          message: '云端平台模式暂不支持自动化任务，请在项目对话中使用当前账号的模型。',
+          message: '云端平台模式已停用自动化任务。',
         },
       });
     });
+    return;
   }
 
   app.get('/api/automation-templates', async (_req, res) => {
