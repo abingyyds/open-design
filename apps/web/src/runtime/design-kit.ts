@@ -17,6 +17,7 @@ import type {
 } from '@open-design/contracts';
 import { designSystemStaticUrl, fetchProjectFileText, projectRawUrl } from '../providers/registry';
 import { parseDesignMd, type ParsedDesignMd } from './design-md-parse';
+import { designSystemPreviewFileUrl, projectPreviewFileUrl } from './preview-file-url';
 
 // ── shared pure helpers (also re-exported from BrandPreviewCard) ──────────
 
@@ -294,6 +295,7 @@ export function brandToKit(brand: Brand, opts: BrandKitOptions): DesignKit {
   const showSystem = ready && Boolean(projectId);
   const asset = (rel: string): string | null =>
     projectId ? withCacheBust(projectRawUrl(projectId, rel), opts.reloadKey) : null;
+  const preview = (rel: string): string => withCacheBust(projectPreviewFileUrl(projectId!, rel), opts.reloadKey);
   const host = opts.host || hostnameOf(brand.sourceUrl || '');
   const imagery: KitImagery | undefined = brand.imagery
     ? {
@@ -343,14 +345,14 @@ export function brandToKit(brand: Brand, opts: BrandKitOptions): DesignKit {
     layout: hasLayout(brand.layout) ? brand.layout : undefined,
     system: showSystem
       ? {
-          kitUrl: withCacheBust(projectRawUrl(projectId!, 'system/kit.html'), opts.reloadKey),
-          kitDarkUrl: withCacheBust(projectRawUrl(projectId!, 'system/kit.dark.html'), opts.reloadKey),
+          kitUrl: preview('system/kit.html'),
+          kitDarkUrl: preview('system/kit.dark.html'),
           tokensUrl: withCacheBust(projectRawUrl(projectId!, 'system/tokens.default.json'), opts.reloadKey),
-          indexUrl: withCacheBust(projectRawUrl(projectId!, 'system/index.html'), opts.reloadKey),
+          indexUrl: preview('system/index.html'),
         }
       : undefined,
     assets: showSystem
-      ? ASSET_TILES.map((a) => ({ kind: a.kind, label: a.label, url: asset(a.file)! }))
+      ? ASSET_TILES.map((a) => ({ kind: a.kind, label: a.label, url: preview(a.file) }))
       : undefined,
     showcaseHtml: opts.showcaseHtml ?? null,
   };
@@ -453,6 +455,7 @@ export function parsedToKit(parsed: ParsedDesignMd, opts: ParsedKitOptions): Des
   const staticUrl = !opts.editable && opts.designSystemId && opts.packageInfo?.manifest
     ? (rel: string): string => designSystemStaticUrl(opts.designSystemId!, rel)
     : null;
+  const preview = (rel: string): string => designSystemPreviewFileUrl(opts.designSystemId!, rel);
 
   return {
     designSystemId: opts.designSystemId,
@@ -473,14 +476,14 @@ export function parsedToKit(parsed: ParsedDesignMd, opts: ParsedKitOptions): Des
     layout: hasLayout(layout) ? layout : undefined,
     system: staticUrl
       ? {
-          kitUrl: staticUrl('system/kit.html'),
-          kitDarkUrl: staticUrl('system/kit.dark.html'),
+          kitUrl: preview('system/kit.html'),
+          kitDarkUrl: preview('system/kit.dark.html'),
           tokensUrl: staticUrl('system/tokens.default.json'),
-          indexUrl: staticUrl('system/index.html'),
+          indexUrl: preview('system/index.html'),
         }
       : undefined,
     assets: staticUrl
-      ? ASSET_TILES.map((a) => ({ kind: a.kind, label: a.label, url: staticUrl(a.file) }))
+      ? ASSET_TILES.map((a) => ({ kind: a.kind, label: a.label, url: preview(a.file) }))
       : undefined,
     showcaseHtml: opts.showcaseHtml ?? null,
   };

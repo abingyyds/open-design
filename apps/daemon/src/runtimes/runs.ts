@@ -366,6 +366,10 @@ export function createChatRunService({
     run.updatedAt = Date.now();
     clearPendingRetryRestart(run);
     closeRunStdin(run);
+    if (run.cancelTask) {
+      await run.cancelTask();
+      return statusBody(run);
+    }
     if (!run.child) {
       finish(run, 'canceled', null, 'SIGTERM');
       return statusBody(run);
@@ -405,6 +409,10 @@ export function createChatRunService({
   const shutdownActive = async ({ graceMs = shutdownGraceMs } = {}) => {
     const activeRuns = Array.from(runs.values()).filter((run) => !TERMINAL_RUN_STATUSES.has(run.status));
     await Promise.all(activeRuns.map(async (run) => {
+      if (run.cancelTask) {
+        await cancel(run);
+        return;
+      }
       run.cancelRequested = true;
       run.updatedAt = Date.now();
       clearPendingRetryRestart(run);

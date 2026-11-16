@@ -20,7 +20,7 @@ import {
   openDatabase,
   upsertMessage,
 } from '../src/db.js';
-import { listLibraryAssets } from '../src/library-store.js';
+import { insertLibraryAsset, listLibraryAssets, migrateLibrary } from '../src/library-store.js';
 import { reconcileLibrary } from '../src/library-sync.js';
 import type Database from 'better-sqlite3';
 
@@ -233,4 +233,17 @@ describe('reconcileLibrary', () => {
     expect(result.designSystems).toBe(0);
     expect(listLibraryAssets(db, {}).filter((asset) => asset.kind === 'design-system')).toEqual([]);
   });
+});
+
+
+it('adds the tenant scope to an existing Library database without assigning old assets', () => {
+  insertLibraryAsset(db, {
+    id: 'legacy', kind: 'html', storage: 'owned', capturedAt: ARTIFACT_TS,
+    archivedDate: ARTIFACT_DATE, contentHash: 'legacy-content',
+  });
+  db.exec('DROP INDEX idx_library_assets_platform_user; ALTER TABLE library_assets DROP COLUMN platform_user_id');
+  migrateLibrary(db);
+  migrateLibrary(db);
+  expect(listLibraryAssets(db)).toMatchObject([{ id: 'legacy' }]);
+  expect(listLibraryAssets(db, {}, 'other-tenant')).toEqual([]);
 });

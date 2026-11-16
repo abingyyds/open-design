@@ -551,7 +551,7 @@ describe('deploy provider routes', () => {
         }
         if (url.endsWith(`/pages/projects/${expectedPagesProject}/domains/demo.example.com`) && method === 'GET') {
           domainListCount += 1;
-          if (domainListCount === 1) {
+          if (domainListCount === 1 || domainListCount === 4) {
             return new Response(JSON.stringify({
               success: false,
               errors: [{ message: 'Custom domain not found' }],
@@ -658,6 +658,15 @@ describe('deploy provider routes', () => {
           },
         });
         expect(ready).not.toHaveProperty('providerMetadata');
+        expect(ready).toHaveProperty('cloudflarePages.customDomain.bindingVerifiedAt', expect.any(Number));
+
+        const removedResp = await fetch(`${baseUrl}/api/projects/${projectId}/deployments/${deployment.id}/check-link`, {
+          method: 'POST',
+        });
+        expect(removedResp.status).toBe(200);
+        const removed = await removedResp.json();
+        expect(removed).toMatchObject({ cloudflarePages: { customDomain: { status: 'failed', domainStatus: 'failed' } } });
+        expect(removed).not.toHaveProperty('cloudflarePages.customDomain.bindingVerifiedAt');
       } finally {
         vi.unstubAllGlobals();
       }

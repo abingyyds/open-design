@@ -26,6 +26,7 @@ import {
   isPublicationGuardedArtifactKind,
 } from './artifacts/publication-guard.js';
 import { normalizeArtifactRuntimeImports } from './artifacts/runtime-compat.js';
+import { hostedPlatformEnabled } from './platform/deployment.js';
 import { isIgnoredProjectDirName } from './project-ignored-dirs.js';
 import {
   isSandboxImportedProjectRootAllowed,
@@ -69,7 +70,7 @@ export class SandboxImportedProjectError extends Error {
   }
 }
 
-function hasExternalProjectRoot(metadata?) {
+export function hasExternalProjectRoot(metadata?: { baseDir?: unknown } | null): boolean {
   if (typeof metadata?.baseDir !== 'string') return false;
   return path.isAbsolute(path.normalize(metadata.baseDir));
 }
@@ -96,6 +97,10 @@ function usesExternalProjectRoot(metadata?) {
 // (metadata.baseDir set), this is the user's own folder. Otherwise falls
 // back to the standard computed path under projectsRoot.
 export function resolveProjectDir(projectsRoot, projectId, metadata?, opts = {}) {
+  // A persisted desktop workspace must never be a hosted project root.
+  if (hasExternalProjectRoot(metadata) && hostedPlatformEnabled()) {
+    throw new Error('Hosted projects cannot access server directories.');
+  }
   if (!opts.allowUnavailableSandboxImportedProject) {
     assertSandboxProjectRootAvailable(metadata);
   }
@@ -1480,6 +1485,10 @@ const EXT_MIME = {
   '.gif': 'image/gif',
   '.webp': 'image/webp',
   '.avif': 'image/avif',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
   '.mp4': 'video/mp4',
   '.mov': 'video/quicktime',
   '.webm': 'video/webm',

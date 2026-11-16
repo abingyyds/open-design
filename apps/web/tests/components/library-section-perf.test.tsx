@@ -25,6 +25,9 @@ vi.mock('../../src/providers/registry', () => ({
   fetchLibraryAssets: (...args: unknown[]) => fetchLibraryAssets(...(args as [])),
   fetchLibraryAsset: (...args: unknown[]) => fetchLibraryAsset(...(args as [])),
   libraryAssetRawUrl: (id: string) => `/raw/${id}`,
+  libraryAssetPreviewUrl: (id: string) => `/preview/${id}`,
+  libraryAssetElementUrl: (id: string) => `/element/${id}`,
+  libraryAssetFigmaUrl: (id: string) => `/figma/${id}`,
   applyLibraryAsset: vi.fn(),
   deleteLibraryAsset: vi.fn(),
   editLibraryAssetAsPage: vi.fn(),
@@ -41,6 +44,7 @@ import {
   snapshotCardRects,
   type CardRect,
 } from '../../src/components/LibrarySection';
+import { LibraryPreviewModal } from '../../src/components/LibraryPreviewModal';
 
 let now = 1_700_000_000_000;
 function makeAsset(over: Partial<LibraryAsset> = {}): LibraryAsset {
@@ -200,9 +204,23 @@ describe('LibrarySection lazy-mount contract', () => {
     await screen.findByText('A design system');
     await waitFor(() => {
       const srcs = [...document.querySelectorAll('iframe')].map((frame) => frame.getAttribute('src'));
-      expect(srcs).toContain('/raw/html-1');
-      expect(srcs).toContain('/raw/ds-1');
+      expect(srcs).toContain('/preview/html-1');
+      expect(srcs).toContain('/preview/ds-1');
     });
+  });
+
+  it('uses the preview route in the HTML modal while retaining the raw download', () => {
+    const asset = makeAsset({ id: 'modal-html', kind: 'html', sourceTitle: 'Modal fixture' });
+    render(
+      <LibraryPreviewModal
+        asset={asset} hasPrev={false} hasNext={false}
+        onPrev={() => {}} onNext={() => {}} onClose={() => {}} onDelete={() => {}}
+      />,
+    );
+    const iframe = document.querySelector('iframe');
+    expect(iframe?.getAttribute('src')).toBe('/preview/modal-html');
+    expect(iframe?.getAttribute('sandbox')).toBe('allow-scripts');
+    expect(document.querySelector('a[download]')?.getAttribute('href')).toBe('/raw/modal-html');
   });
 
   it('holds the in-view thumbnail behind a loading skeleton until its bytes land', async () => {

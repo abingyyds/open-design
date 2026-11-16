@@ -12,6 +12,7 @@
 // Routes that mutate stay token- or loopback-gated; reads ride the daemon's
 // loopback binding + same-origin middleware like the rest of `/api`.
 
+import { setHostedDownloadHeaders, setHostedPreviewHeaders } from '../http/hosted-file-response.js';
 import { createReadStream } from 'node:fs';
 import { copyFile, readFile, stat, unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -45,7 +46,8 @@ import {
   writeFigmaSidecar,
 } from '../library.js';
 import { reconcileLibrary, type ReconcileLibraryResult } from '../library-sync.js';
-import { ensureProjectSubdir } from '../projects.js';
+import { ensureProjectSubdir, hasExternalProjectRoot, resolveProjectFilePath } from '../projects.js';
+import { hostedProjectDirectory } from '../platform/hosted-task-project.js';
 import {
   confirmPairing,
   libraryConnectionStatus,
@@ -68,7 +70,7 @@ const MAX_REMOTE_BYTES = 25 * 1024 * 1024;
 
 /** Strip the internal absolute `filePath` before returning an asset to a client. */
 function toPublicAsset(record: LibraryAssetRecord): LibraryAsset {
-  const { filePath: _filePath, ...rest } = record;
+  const { filePath: _filePath, platformUserId: _platformUserId, ...rest } = record;
   return rest;
 }
 
@@ -126,10 +128,17 @@ async function fetchRemoteBytes(url: string): Promise<{ bytes: Buffer; mime: str
 export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDeps): void {
   const { db } = ctx;
   const platform = ctx.platform;
+  const tenantId = (req: Request) => platform?.enabled ? platform.currentUser?.(req)?.id : undefined;
+  const ownsManagedProject = (
+    req: Request,
+    project: { metadata?: unknown } | null,
+  ): boolean =>
+    platform?.projectBelongsToRequest?.(req, project) === true
+    && !hasExternalProjectRoot(project?.metadata as { baseDir?: unknown } | undefined);
+
   const requirePlatformProject = (req: Request, res: Response, projectId: string): boolean => {
     if (!platform?.enabled) return true;
-    const project = ctx.projectStore.getProject(db, projectId);
-    if (platform.projectBelongsToRequest?.(req, project) === true) return true;
+    if (ownsManagedProject(req, ctx.projectStore.getProject(db, projectId))) return true;
     sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
     return false;
   };
@@ -141,6 +150,35 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
   const { insertConversation } = ctx.conversations;
   const { authorizeToolRequest } = ctx.auth;
 
+  function visibleAsset(req: Request, asset: LibraryAssetRecord): boolean {
+    if (!platform?.enabled) return true;
+    const userId = tenantId(req);
+    if (!userId || asset.platformUserId !== userId) return false;
+    return asset.storage === 'owned' || Boolean(asset.originProjectId
+      && ownsManagedProject(req, getProject(db, asset.originProjectId)));
+  }
+
+  function getVisibleAsset(req: Request, id: string): LibraryAssetRecord | null {
+    const asset = getLibraryAsset(db, id);
+    return asset && visibleAsset(req, asset) ? asset : null;
+  }
+
+  function listVisibleAssets(req: Request, filter: LibraryAssetFilter): LibraryAssetRecord[] {
+    const userId = tenantId(req);
+    if (platform?.enabled && !userId) return [];
+    return listLibraryAssets(db, filter, userId).filter((asset) => visibleAsset(req, asset));
+  }
+
+  async function resolveVisibleBytes(asset: LibraryAssetRecord): Promise<string | null> {
+    if (!platform?.enabled || asset.storage === 'owned') {
+      return resolveAssetBytesPath(asset, PROJECTS_DIR);
+    }
+    if (!asset.originProjectId || !asset.relPath) return null;
+    const projectRoot = await hostedProjectDirectory(PROJECTS_DIR, asset.originProjectId);
+    const file = await resolveProjectFilePath(path.dirname(projectRoot), asset.originProjectId, asset.relPath);
+    return file.filePath;
+  }
+
   // Copy an asset's bytes into a project (under a `library/` subdir) and record
   // the project usage as a source back-link. Shared by the loopback apply route
   // and the agent tool-token route.
@@ -151,7 +189,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
     dir?: string,
     includeElement = false,
   ): Promise<{ relPath: string; elementRelPath?: string }> {
-    const bytesPath = resolveAssetBytesPath(asset, PROJECTS_DIR);
+    const bytesPath = await resolveVisibleBytes(asset);
     if (!bytesPath) throw new Error('asset bytes not available');
     const project = getProject(db, projectId);
     if (!project) throw new Error('project not found');
@@ -162,7 +200,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
       subdir,
       project.metadata,
     );
-    const stem = asset.contentHash.slice(0, 12);
+    const stem = asset.contentHash.replace(/^hosted-/, '').slice(0, 12);
     const ext = extForMime(asset.mime, undefined);
     const name = `${stem}${ext}`;
     await copyFile(bytesPath, path.join(absDir, name));
@@ -188,41 +226,49 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
     return elementRelPath ? { relPath, elementRelPath } : { relPath };
   }
 
-  // Reconcile design systems + agent project deliverables into the Library as
-  // referenced rows. Throttled so opening the Library (which lists assets) keeps
-  // it current without re-scanning on every keystroke-driven re-fetch; a single
-  // in-flight pass is shared by concurrent callers. `force` (the Sync button /
-  // `od library sync`) bypasses the throttle.
+  // Share in-flight scans and throttle automatic refreshes inside each tenant.
+  // Local mode continues to reconcile its single workspace.
   const RECONCILE_THROTTLE_MS = 10_000;
-  let lastReconcileAt = 0;
-  let reconcileInFlight: Promise<ReconcileLibraryResult> | null = null;
+  const reconciles = new Map<string | undefined, {
+    inFlight?: Promise<ReconcileLibraryResult>;
+    finishedAt: number;
+  }>();
   const EMPTY_RECONCILE: ReconcileLibraryResult = {
     designSystems: 0,
     projectAssets: 0,
     deduped: 0,
     total: 0,
   };
-  async function runReconcile(force: boolean): Promise<ReconcileLibraryResult> {
-    if (reconcileInFlight) return reconcileInFlight;
-    if (!force && Date.now() - lastReconcileAt < RECONCILE_THROTTLE_MS) {
-      return EMPTY_RECONCILE;
+  async function runReconcile(req: Request, force: boolean): Promise<ReconcileLibraryResult> {
+    const userId = tenantId(req);
+    if (platform?.enabled && !userId) return EMPTY_RECONCILE;
+    const now = Date.now();
+    for (const [tenant, state] of reconciles) {
+      if (!state.inFlight && now - state.finishedAt >= RECONCILE_THROTTLE_MS) {
+        reconciles.delete(tenant);
+      }
     }
-    reconcileInFlight = reconcileLibrary(db, {
-      LIBRARY_DIR,
-      PROJECTS_DIR,
-      USER_DESIGN_SYSTEMS_DIR,
-    }).finally(() => {
-      lastReconcileAt = Date.now();
-      reconcileInFlight = null;
+    const state = reconciles.get(userId);
+    if (state?.inFlight) return state.inFlight;
+    if (state && !force) return EMPTY_RECONCILE;
+
+    const inFlight = reconcileLibrary(
+      db,
+      { LIBRARY_DIR, PROJECTS_DIR, USER_DESIGN_SYSTEMS_DIR },
+      userId ? { userId, ownsManagedProject: (project) => ownsManagedProject(req, project) } : undefined,
+    ).finally(() => {
+      reconciles.set(userId, { finishedAt: Date.now() });
     });
-    return reconcileInFlight;
+    reconciles.set(userId, { inFlight, finishedAt: 0 });
+    return inFlight;
   }
 
   // Live ingest/enrichment feed. Clipper captures flow through this route, so
   // the web grid can update without polling.
-  const sseClients = new Set<(event: string, data: unknown) => void>();
-  const emit = (event: string, data: unknown) => {
-    for (const send of sseClients) {
+  const sseClients = new Map<(event: string, data: unknown) => void, string | undefined>();
+  const emit = (event: string, data: unknown, userId?: string) => {
+    for (const [send, subscriberId] of sseClients) {
+      if (subscriberId !== userId) continue;
       try {
         send(event, data);
       } catch {
@@ -232,6 +278,16 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
   };
 
   // --- pairing -------------------------------------------------------------
+
+  if (platform?.enabled) {
+    app.use('/api/library', (_req, res, next) => {
+      res.setHeader('Cache-Control', 'private, no-store');
+      next();
+    });
+    app.use(['/api/library/pair', '/api/library/connection'], (_req, res) =>
+      sendApiError(res, 403, 'FORBIDDEN', 'Shared Library pairing is unavailable in hosted mode'),
+    );
+  }
 
   // Loopback-only: the OD UI mints a pairing code to show the user.
   app.post('/api/library/pair', requireLocalDaemonRequest, (_req, res) => {
@@ -273,6 +329,10 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
     res.status(204).end();
   });
   app.post('/api/library/ingest', async (req, res) => {
+    const userId = tenantId(req);
+    if (platform?.enabled && !userId) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Hosted Library uploads require a tenant session');
+    }
     applyExtensionCors(req, res);
     // Trusted callers, no pairing required. A browser-extension origin can only
     // be presented by a locally-installed extension reaching the loopback
@@ -283,7 +343,9 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
     const isExtensionOrigin =
       origin.startsWith('chrome-extension://') || origin.startsWith('moz-extension://');
     let sourceKind: LibrarySourceKind;
-    if (isExtensionOrigin || validateLibraryToken(db, bearerToken(req)).ok) {
+    if (userId) {
+      sourceKind = 'manual-upload';
+    } else if (isExtensionOrigin || validateLibraryToken(db, bearerToken(req)).ok) {
       sourceKind = 'clipper';
     } else if (isLocalSameOrigin(req, resolvedPortRef.current)) {
       sourceKind = 'manual-upload';
@@ -336,6 +398,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
         bytes = parsed.bytes;
         mime = mime ?? parsed.mime;
       } else if (typeof body.url === 'string') {
+        if (userId) return sendApiError(res, 403, 'FORBIDDEN', 'Hosted Library uploads must include file content');
         const fetched = await fetchRemoteBytes(body.url);
         bytes = fetched.bytes;
         mime = mime ?? fetched.mime;
@@ -377,6 +440,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
         db,
         libraryDir: LIBRARY_DIR,
         storage: 'owned',
+        platformUserId: userId,
         bytes,
         text,
         kind: typeof body.kind === 'string' ? (body.kind as LibraryAssetKind) : undefined,
@@ -413,7 +477,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
       }
 
       const asset = toPublicAsset(assetRecord);
-      emit('ingest', { assetId: asset.id, deduped: result.deduped });
+      emit('ingest', { assetId: asset.id, deduped: result.deduped }, userId);
       res.json({ asset, taskId: result.taskId, deduped: result.deduped });
     } catch (err) {
       return sendApiError(res, 500, 'INGEST_FAILED', err instanceof Error ? err.message : String(err));
@@ -430,7 +494,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
     // Keep the Library current with design systems / agent output before
     // listing, so an opened grid already shows them. Throttled + best-effort —
     // never blocks the list on a reconcile error.
-    await runReconcile(false).catch(() => {});
+    await runReconcile(req, false).catch(() => {});
     const q = req.query;
     const str = (v: unknown): string | undefined => (typeof v === 'string' && v.length ? v : undefined);
     // Build conditionally — exactOptionalPropertyTypes rejects explicit
@@ -445,16 +509,16 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
     if (str(q.projectId)) filter.projectId = str(q.projectId)!;
     if (str(q.designSystemId)) filter.designSystemId = str(q.designSystemId)!;
     if (q.limit) filter.limit = Number(q.limit);
-    const assets = listLibraryAssets(db, filter).map(toPublicAsset);
+    const assets = listVisibleAssets(req, filter).map(toPublicAsset);
     res.json({ assets });
   });
 
   // Force a full reconcile pass (the web "Sync" button + `od library sync`).
   // Backfills design systems and agent deliverables that predate this feature,
   // and is the explicit "pull in everything now" entry point. Loopback-only.
-  app.post('/api/library/sync', requireLocalDaemonRequest, async (_req, res) => {
+  app.post('/api/library/sync', requireLocalDaemonRequest, async (req, res) => {
     try {
-      const summary = await runReconcile(true);
+      const summary = await runReconcile(req, true);
       res.json(summary);
     } catch (err) {
       return sendApiError(res, 500, 'LIBRARY_SYNC_FAILED', err instanceof Error ? err.message : String(err));
@@ -462,13 +526,13 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
   });
 
   app.get('/api/library/assets/:id', (req, res) => {
-    const asset = getLibraryAsset(db, req.params.id);
+    const asset = getVisibleAsset(req, req.params.id);
     if (!asset) return sendApiError(res, 404, 'NOT_FOUND', 'asset not found');
     res.json({ asset: toPublicAsset(asset) });
   });
 
   app.delete('/api/library/assets/:id', requireLocalDaemonRequest, async (req, res) => {
-    const asset = getLibraryAsset(db, req.params.id);
+    const asset = getVisibleAsset(req, req.params.id);
     if (!asset) return sendApiError(res, 404, 'NOT_FOUND', 'asset not found');
     // Only unlink bytes we own and that live under LIBRARY_DIR.
     if (asset.storage === 'owned' && asset.filePath) {
@@ -478,24 +542,45 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
       }
     }
     deleteLibraryAsset(db, asset.id);
-    emit('delete', { assetId: asset.id });
+    emit('delete', { assetId: asset.id }, tenantId(req));
     res.json({ ok: true });
   });
 
   app.get('/api/library/assets/:id/raw', async (req, res) => {
-    const asset = getLibraryAsset(db, req.params.id);
+    const asset = getVisibleAsset(req, req.params.id);
     if (!asset) return sendApiError(res, 404, 'NOT_FOUND', 'asset not found');
-    const abs = resolveAssetBytesPath(asset, PROJECTS_DIR);
-    if (!abs) return sendApiError(res, 404, 'NOT_FOUND', 'asset bytes not available');
     try {
+      const abs = await resolveVisibleBytes(asset);
+      if (!abs) return sendApiError(res, 404, 'NOT_FOUND', 'asset bytes not available');
       const info = await stat(abs);
       if (!info.isFile()) return sendApiError(res, 404, 'NOT_FOUND', 'asset bytes not available');
-      res.setHeader('Content-Type', asset.mime ?? 'application/octet-stream');
+      const mime = asset.mime ?? 'application/octet-stream';
+      res.setHeader('Content-Type', mime);
       res.setHeader('Content-Length', String(info.size));
-      res.setHeader('Cache-Control', 'private, max-age=3600');
+      if (platform?.enabled) setHostedDownloadHeaders(res, mime);
+      else res.setHeader('Cache-Control', 'private, max-age=3600');
       createReadStream(abs).pipe(res);
     } catch {
       return sendApiError(res, 404, 'NOT_FOUND', 'asset bytes not available');
+    }
+  });
+
+  // HTML is an attachment on /raw. This separately authorized endpoint
+  // serves the thumbnail and modal with an opaque origin in hosted mode.
+  app.get('/api/library/assets/:id/preview', async (req, res) => {
+    const asset = getVisibleAsset(req, req.params.id);
+    if (!asset || (asset.kind !== 'html' && asset.kind !== 'design-system')) {
+      return sendApiError(res, 404, 'NOT_FOUND', 'asset preview not found');
+    }
+    try {
+      const abs = await resolveVisibleBytes(asset);
+      if (!abs || !(await stat(abs)).isFile()) {
+        return sendApiError(res, 404, 'NOT_FOUND', 'asset preview not found');
+      }
+      if (platform?.enabled) setHostedPreviewHeaders(res);
+      res.type('text/html').sendFile(abs);
+    } catch {
+      return sendApiError(res, 404, 'NOT_FOUND', 'asset preview not found');
     }
   });
 
@@ -504,7 +589,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
   // downloadable JSON, importable via the OD Figma plugin. Reads ride loopback
   // same-origin like /raw; the clipper downloads its own captures directly.
   app.get('/api/library/assets/:id/figma', async (req, res) => {
-    const asset = getLibraryAsset(db, req.params.id);
+    const asset = getVisibleAsset(req, req.params.id);
     if (!asset) return sendApiError(res, 404, 'NOT_FOUND', 'asset not found');
     const sidecar = resolveAssetFigmaSidecarPath(asset, LIBRARY_DIR);
     if (!sidecar) return sendApiError(res, 404, 'NOT_FOUND', 'no figma capture for this asset');
@@ -514,7 +599,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
       res.setHeader('Content-Type', 'application/json');
       res.setHeader('Content-Length', String(info.size));
       res.setHeader('Content-Disposition', `attachment; filename="${figmaDownloadName(asset)}"`);
-      res.setHeader('Cache-Control', 'private, max-age=3600');
+      if (!platform?.enabled) res.setHeader('Cache-Control', 'private, max-age=3600');
       createReadStream(sidecar).pipe(res);
     } catch {
       return sendApiError(res, 404, 'NOT_FOUND', 'no figma capture for this asset');
@@ -525,16 +610,18 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
   // Serve the outerHTML sidecar of an element-pick screenshot. Read on demand
   // by the Library preview's "Element HTML" panel.
   app.get('/api/library/assets/:id/element', async (req, res) => {
-    const asset = getLibraryAsset(db, req.params.id);
+    const asset = getVisibleAsset(req, req.params.id);
     if (!asset) return sendApiError(res, 404, 'NOT_FOUND', 'asset not found');
     const sidecar = resolveAssetElementSidecarPath(asset, LIBRARY_DIR);
     if (!sidecar) return sendApiError(res, 404, 'NOT_FOUND', 'no element markup for this asset');
     try {
       const info = await stat(sidecar);
       if (!info.isFile()) return sendApiError(res, 404, 'NOT_FOUND', 'no element markup for this asset');
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      const mime = 'text/html; charset=utf-8';
+      res.setHeader('Content-Type', mime);
       res.setHeader('Content-Length', String(info.size));
-      res.setHeader('Cache-Control', 'private, max-age=3600');
+      if (platform?.enabled) setHostedDownloadHeaders(res, mime);
+      else res.setHeader('Cache-Control', 'private, max-age=3600');
       createReadStream(sidecar).pipe(res);
     } catch {
       return sendApiError(res, 404, 'NOT_FOUND', 'no element markup for this asset');
@@ -544,7 +631,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
   // --- apply to project (web / Insert from Library) ------------------------
 
   app.post('/api/library/assets/:id/apply', requireLocalDaemonRequest, async (req, res) => {
-    const asset = getLibraryAsset(db, req.params.id);
+    const asset = getVisibleAsset(req, req.params.id);
     if (!asset) return sendApiError(res, 404, 'NOT_FOUND', 'asset not found');
     const projectId = typeof req.body?.projectId === 'string' ? req.body.projectId : '';
     if (!projectId) return sendApiError(res, 400, 'BAD_REQUEST', 'projectId is required');
@@ -568,14 +655,14 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
   // user can edit it (srcDoc bridge + agent surgical edits) right away. This is
   // the clipper "capture → editable OD page" exit, driven from the Library.
   app.post('/api/library/assets/:id/edit-as-page', requireLocalDaemonRequest, async (req, res) => {
-    const asset = getLibraryAsset(db, req.params.id);
+    const asset = getVisibleAsset(req, req.params.id);
     if (!asset) return sendApiError(res, 404, 'NOT_FOUND', 'asset not found');
     if (asset.kind !== 'html') {
       return sendApiError(res, 400, 'NOT_HTML', 'only html captures can be opened as an editable page');
     }
-    const bytesPath = resolveAssetBytesPath(asset, PROJECTS_DIR);
-    if (!bytesPath) return sendApiError(res, 404, 'NOT_FOUND', 'asset bytes not available');
     try {
+      const bytesPath = await resolveVisibleBytes(asset);
+      if (!bytesPath) return sendApiError(res, 404, 'NOT_FOUND', 'asset bytes not available');
       const html = await readFile(bytesPath, 'utf8');
       const now = Date.now();
       const projectId = randomUUID();
@@ -634,7 +721,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
     if (typeof body.kind === 'string') filter.kind = body.kind as LibraryAssetKind;
     if (typeof body.date === 'string') filter.date = body.date;
     filter.limit = Number.isFinite(body.limit) ? Number(body.limit) : 20;
-    const results = listLibraryAssets(db, filter).map((asset) => ({ asset: toPublicAsset(asset), score: 0 }));
+    const results = listVisibleAssets(req, filter).map((asset) => ({ asset: toPublicAsset(asset), score: 0 }));
     res.json({ results, semantic: false });
   });
 
@@ -643,7 +730,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
     if (!grant) return;
     const assetId = typeof req.body?.assetId === 'string' ? req.body.assetId : '';
     if (!assetId) return sendApiError(res, 400, 'BAD_REQUEST', 'assetId is required');
-    const asset = getLibraryAsset(db, assetId);
+    const asset = getVisibleAsset(req, assetId);
     if (!asset) return sendApiError(res, 404, 'NOT_FOUND', 'asset not found');
     const projectId = grant.projectId ?? (typeof req.body?.projectId === 'string' ? req.body.projectId : '');
     if (!projectId) return sendApiError(res, 400, 'BAD_REQUEST', 'projectId is required');
@@ -665,7 +752,7 @@ export function registerLibraryRoutes(app: Express, ctx: RegisterLibraryRoutesDe
   app.get('/api/library/events', (req, res) => {
     const sse = createSseResponse(res);
     const listener = (event: string, data: unknown) => sse.send(event, data);
-    sseClients.add(listener);
+    sseClients.set(listener, tenantId(req));
     sse.send('ready', { ok: true });
     req.on('close', () => {
       sseClients.delete(listener);

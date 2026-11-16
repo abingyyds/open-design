@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -8,6 +9,8 @@ import {
   type ReactNode,
 } from 'react';
 import { Button } from '@open-design/components';
+import { HOSTED_PREVIEW_SANDBOX } from '@open-design/contracts';
+import { HostedPreviewFrame } from './HostedPreviewFrame';
 import type { DesignSystemEditClickProps, TrackingProjectKind } from '@open-design/contracts/analytics';
 import { useAnalytics } from '../analytics/provider';
 import {
@@ -52,6 +55,8 @@ import {
 import { latestTodosFromEvents, type TodoItem } from '../runtime/todos';
 import { deliverableSlideNavForActiveFile, isSlideNavDeliverableNow } from '../runtime/slide-nav';
 import { buildSrcdoc } from '../runtime/srcdoc';
+import { projectPreviewFileUrl } from '../runtime/preview-file-url';
+import { HostedPlatformContext } from '../providers/platform';
 import { useDesignKit, hostnameOf, type KitColor } from '../runtime/design-kit';
 import { useKitModuleUpload } from '../runtime/kit-upload';
 import {
@@ -4462,6 +4467,7 @@ function DesignSystemInlinePreview({
   projectId: string;
   file: ProjectFile;
 }) {
+  const hosted = useContext(HostedPlatformContext);
   const url = projectFileUrl(projectId, file.name);
   const [srcDoc, setSrcDoc] = useState<string | null>(null);
   const [srcDocReady, setSrcDocReady] = useState(false);
@@ -4469,7 +4475,7 @@ function DesignSystemInlinePreview({
   useEffect(() => {
     setSrcDoc(null);
     setSrcDocReady(false);
-    if (file.kind !== 'html') return undefined;
+    if (hosted || file.kind !== 'html') return undefined;
     let cancelled = false;
     void fetchProjectFileText(projectId, file.name, {
       cache: 'no-store',
@@ -4490,9 +4496,18 @@ function DesignSystemInlinePreview({
     return () => {
       cancelled = true;
     };
-  }, [file.kind, file.mtime, file.name, projectId]);
+  }, [hosted, file.kind, file.mtime, file.name, projectId]);
 
   if (file.kind === 'html') {
+    if (hosted) {
+      return (
+        <HostedPreviewFrame
+          title={file.name}
+          src={`${projectPreviewFileUrl(projectId, file.name)}?v=${Math.round(file.mtime)}`}
+          sandbox={HOSTED_PREVIEW_SANDBOX}
+        />
+      );
+    }
     return (
       <iframe
         title={file.name}

@@ -15,6 +15,7 @@
 import {
   Fragment,
   useCallback,
+  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -27,9 +28,11 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { Button, Textarea } from '@open-design/components';
+import { HOSTED_PREVIEW_SANDBOX } from '@open-design/contracts';
 import type { DesignSystemEditClickProps } from '@open-design/contracts/analytics';
 import { useT } from '../i18n';
 import { openExternalUrl, projectRawUrl } from '../providers/registry';
+import { HostedPlatformContext } from '../providers/platform';
 import { buildSrcdoc } from '../runtime/srcdoc';
 import {
   fontStack,
@@ -39,6 +42,7 @@ import {
 } from '../runtime/design-kit';
 import type { KitUploadModule } from '../runtime/kit-upload';
 import { Icon, type IconName } from './Icon';
+import { HostedPreviewFrame } from './HostedPreviewFrame';
 import { KitErrorBoundary } from './KitErrorBoundary';
 import styles from './BrandPreviewCard.module.css';
 
@@ -319,6 +323,8 @@ function DesignKitViewInner({
   dataTestId = 'design-kit-view',
 }: DesignKitViewProps) {
   const t = useT();
+  const hosted = useContext(HostedPlatformContext);
+  const previewSandbox = hosted ? HOSTED_PREVIEW_SANDBOX : DESIGN_KIT_PREVIEW_SANDBOX;
   const compact = variant === 'compact';
   const [coverPreviewOpen, setCoverPreviewOpen] = useState(false);
   const [tokens, setTokens] = useState<BrandTokenSubset | null>(null);
@@ -976,8 +982,8 @@ function DesignKitViewInner({
               <iframe
                 className={styles.coverFrame}
                 title={`${kit.name} preview`}
-                sandbox={DESIGN_KIT_PREVIEW_SANDBOX}
-                srcDoc={buildSrcdoc(kit.showcaseHtml)}
+                sandbox={previewSandbox}
+                srcDoc={buildSrcdoc(kit.showcaseHtml, { hosted })}
                 tabIndex={-1}
               />
             </span>
@@ -1500,12 +1506,13 @@ function DesignKitViewInner({
                   </div>
                   <span className={styles.dsCap}>system/kit.html</span>
                 </div>
-                <iframe
+                <HostedPreviewFrame
+                  hosted={hosted}
                   key={dsKitUrl}
                   className={styles.dsFrame}
                   src={dsKitUrl}
                   loading="lazy"
-                  sandbox={DESIGN_KIT_PREVIEW_SANDBOX}
+                  sandbox={previewSandbox}
                   title={t('brandDetail.designSystem')}
                 />
               </div>
@@ -1547,12 +1554,13 @@ function DesignKitViewInner({
                     }}
                   >
                     <div className={styles.assetFrame}>
-                      <iframe
+                      <HostedPreviewFrame
+                        hosted={hosted}
                         src={a.url}
                         loading="lazy"
                         tabIndex={-1}
                         aria-hidden="true"
-                        sandbox={DESIGN_KIT_PREVIEW_SANDBOX}
+                        sandbox={previewSandbox}
                         title={a.label}
                       />
                     </div>
@@ -1628,11 +1636,12 @@ function DesignKitViewInner({
                         </button>
                       </div>
                     </div>
-                    <iframe
+                    <HostedPreviewFrame
+                      hosted={hosted}
                       className={styles.assetModalFrame}
                       src={assetPreview.url}
                       title={assetPreview.label}
-                      sandbox={DESIGN_KIT_PREVIEW_SANDBOX}
+                      sandbox={previewSandbox}
                     />
                   </div>
                 </div>
@@ -1662,8 +1671,8 @@ function DesignKitViewInner({
                       className={styles.assetModalFrame}
                       data-testid="design-kit-cover-preview-frame"
                       title={`${kit.name} preview`}
-                      sandbox={DESIGN_KIT_PREVIEW_SANDBOX}
-                      srcDoc={buildSrcdoc(kit.showcaseHtml)}
+                      sandbox={previewSandbox}
+                      srcDoc={buildSrcdoc(kit.showcaseHtml, { hosted })}
                     />
                   </div>
                 </div>

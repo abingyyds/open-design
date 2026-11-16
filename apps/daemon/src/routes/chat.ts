@@ -55,7 +55,9 @@ const FEEDBACK_REASON_ALLOWLIST: ReadonlySet<string> = new Set([
   'other',
 ]);
 
-export interface RegisterChatRoutesDeps extends RouteDeps<'db' | 'design' | 'http' | 'chat' | 'agents' | 'critique' | 'validation' | 'lifecycle' | 'paths' | 'telemetry'> {}
+export interface RegisterChatRoutesDeps extends RouteDeps<'db' | 'design' | 'http' | 'chat' | 'agents' | 'critique' | 'validation' | 'lifecycle' | 'paths' | 'telemetry'> {
+  platform?: { enabled: boolean };
+}
 
 export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
   const { db, design } = ctx;
@@ -310,6 +312,9 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
       }
 
       if (body.mode === 'agent') {
+        if (ctx.platform?.enabled) {
+          return sendApiError(res, 403, 'FORBIDDEN', 'Host agent connection checks are unavailable in hosted mode');
+        }
         if (typeof body.agentId !== 'string' || !body.agentId.trim()) {
           return sendApiError(res, 400, 'BAD_REQUEST', 'agentId is required');
         }

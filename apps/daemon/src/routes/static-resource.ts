@@ -1,4 +1,4 @@
-import type { Express } from 'express';
+import type { Express, Request } from 'express';
 import type Database from 'better-sqlite3';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -20,12 +20,13 @@ import {
   LocalDesignSystemImportError,
   importLocalDesignSystemProject,
 } from '../design-systems/import.js';
-import { importGitHubDesignSystemProject } from '../design-systems/github-import.js';
+import { importGitHubDesignSystemProject, installHostedGitHubDesignSystemPackage } from '../design-systems/github-import.js';
 import { importShadcnDesignSystemProject } from '../design-systems/shadcn-import.js';
 import { renderDesignSystemPreview } from '../design-systems/preview.js';
 import { renderDesignSystemShowcase } from '../design-systems/showcase.js';
 import { listPromptTemplates, readPromptTemplate } from '../prompt-templates.js';
 import { readAppConfig } from '../app-config.js';
+import { setHostedDownloadHeaders, setHostedPreviewHeaders } from '../http/hosted-file-response.js';
 import { installFromTarget, uninstallById } from '../library-install.js';
 import type { RouteDeps } from '../server-context.js';
 
@@ -103,28 +104,17 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
     const user = platformUserForRequest(req);
     return Boolean(user?.id && designSystem?.platformUserId === user.id);
   };
-  const stampImportedDesignSystemOwner = async (dirId: string, userId: string): Promise<void> => {
-    if (!/^[A-Za-z0-9._-]{1,160}$/.test(dirId)) return;
-    const metadataPath = path.join(USER_DESIGN_SYSTEMS_DIR, dirId, 'metadata.json');
-    let metadata: Record<string, unknown> = {};
-    try {
-      const raw = await fs.promises.readFile(metadataPath, 'utf8');
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) metadata = parsed;
-    } catch {
-      // Imported systems may not have metadata yet.
-    }
-    await fs.promises.writeFile(
-      metadataPath,
-      `${JSON.stringify({ ...metadata, platformUserId: userId }, null, 2)}\n`,
-      'utf8',
-    );
-  };
   const requireLocalOrigin = (req: any, res: any) => {
     if (isLocalSameOrigin(req, resolvedPortRef.current)) return true;
     sendApiError(res, 403, 'FORBIDDEN', 'local origin required');
     return false;
   };
+  if (platform?.enabled) {
+    app.use('/api/skills', (req, res, next) => {
+      if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+      return sendApiError(res, 403, 'FORBIDDEN', 'The shared skill catalog is read-only in hosted mode');
+    });
+  }
   const requireDesignSystemOrigin = (req: any, res: any) => {
     // In hosted platform mode the browser origin has already passed the
     // daemon's public-origin guard and the request carries a tenant session.
@@ -171,8 +161,7 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
     let models = [];
     let runtimeModel = '';
     try {
-      const runtime = platform.runtimeForUser(user.id);
-      runtimeModel = runtime.model || '';
+      runtimeModel = platform.modelForUser(user.id);
       const result = await platform.fetchModels(user.id);
       models = Array.isArray(result.models)
         ? result.models
@@ -219,6 +208,10 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
       res.write(`event: agent\ndata: ${JSON.stringify(platformAgent)}\n\n`);
       res.write('event: done\ndata: {}\n\n');
       res.end();
+      return;
+    }
+    if (platform?.enabled) {
+      res.json({ agents: [] });
       return;
     }
     let config;
@@ -563,6 +556,7 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
   //      so a skill that aggregates examples (like live-artifact) still has
   //      a real preview on its parent card instead of returning 404.
   app.get('/api/skills/:id/example', async (req, res) => {
+    if (platform?.enabled) setHostedPreviewHeaders(res);
     try {
       // Span both functional skills and design templates: rendered example
       // HTML rewrites assets to /api/skills/<id>/... and we want those URLs
@@ -713,7 +707,9 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
       if (req.headers.origin === 'null') {
         res.header('Access-Control-Allow-Origin', '*');
       }
-      await res.type(mimeFor(target)).sendFile(target);
+      const mime = mimeFor(target);
+      if (platform?.enabled) setHostedDownloadHeaders(res, mime);
+      await res.type(mime).sendFile(target);
     } catch (err: any) {
       res.status(500).type('text/plain').send(String(err));
     }
@@ -757,29 +753,69 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
     }
   });
 
+  async function importGitHubForRequest(req: Request, githubUrl: string) {
+    const body = req.body ?? {};
+    const before = await listAllDesignSystems();
+    const importMode = normalizeDesignSystemImportMode(body.importMode);
+    const craftApplies = normalizeDesignSystemCraftApplies(body.craftApplies);
+    const userId = platformUserForRequest(req)?.id;
+    return importGitHubDesignSystemProject(
+      githubUrl,
+      platform?.enabled ? path.join(RUNTIME_DATA_DIR, 'tmp') : path.join(PROJECT_ROOT, '.tmp'),
+      USER_DESIGN_SYSTEMS_DIR,
+      {
+        ...(typeof body.name === 'string' ? { name: body.name } : {}),
+        ...(typeof body.branch === 'string' ? { branch: body.branch } : {}),
+        ...(importMode ? { importMode } : {}),
+        ...(craftApplies ? { craftApplies } : {}),
+        ...(userId ? { platformUserId: userId } : {}),
+        reservedIds: designSystemDirIdsFromCatalog(before),
+      },
+    );
+  }
+
   app.post('/api/design-systems/install', async (req, res) => {
+    if (platform?.enabled && req.body?.source === 'local') {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Hosted design systems cannot import server directories');
+    }
     if (!requireDesignSystemOrigin(req, res)) return;
     try {
-      const result = await installFromTarget(req.body, USER_DESIGN_SYSTEMS_DIR, 'design-system');
-      if (!result.ok) return res.status(400).json({ error: result.error });
-      if (typeof result.dir !== 'string' || !result.dir) {
-        return res.status(500).json({ error: 'design system install did not return an installation directory' });
+      let designSystemId: string;
+      if (platform?.enabled) {
+        if (req.body?.source !== 'github' || typeof req.body.url !== 'string') {
+          return sendApiError(res, 400, 'BAD_REQUEST', 'A public GitHub repository URL is required');
+        }
+        const userId = platformUserForRequest(req)?.id;
+        if (!userId) return sendApiError(res, 403, 'FORBIDDEN', 'A tenant session is required');
+        designSystemId = await installHostedGitHubDesignSystemPackage(
+          req.body.url, path.join(RUNTIME_DATA_DIR, 'tmp'), USER_DESIGN_SYSTEMS_DIR, { platformUserId: userId },
+        );
+      } else {
+        const result = await installFromTarget(req.body, USER_DESIGN_SYSTEMS_DIR, 'design-system');
+        if (!result.ok) return res.status(400).json({ error: result.error });
+        if (typeof result.dir !== 'string' || !result.dir) {
+          return res.status(500).json({ error: 'design system install did not return an installation directory' });
+        }
+        designSystemId = path.basename(fs.realpathSync.native(result.dir));
       }
-      const platformUser = platformUserForRequest(req);
-      if (platformUser) await stampImportedDesignSystemOwner(path.basename(result.dir), platformUser.id);
       const systems = await listAllDesignSystems();
-      const designSystemId = path.basename(fs.realpathSync.native(result.dir));
       const designSystem = findUserDesignSystemInCatalog(systems, designSystemId);
       if (!designSystem) {
-        return res.status(500).json({ error: `installed design system was not found in catalog: ${result.dir}` });
+        return res.status(500).json({ error: `installed design system was not found in catalog: ${designSystemId}` });
       }
       res.json({ designSystem });
     } catch (err: any) {
+      if (err instanceof LocalDesignSystemImportError) {
+        return sendApiError(res, err.code === 'BAD_REQUEST' ? 400 : 500, err.code, err.message);
+      }
       res.status(500).json({ error: String(err) });
     }
   });
 
   app.post('/api/design-systems/import/local', async (req, res) => {
+    if (platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Hosted design systems cannot import server directories');
+    }
     if (!requireDesignSystemOrigin(req, res)) return;
     try {
       const body = req.body && typeof req.body === 'object' ? req.body : {};
@@ -857,22 +893,7 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
           : typeof body.url === 'string'
             ? body.url
             : '';
-      const before = await listAllDesignSystems();
-      const importMode = normalizeDesignSystemImportMode(body.importMode);
-      const craftApplies = normalizeDesignSystemCraftApplies(body.craftApplies);
-      const result = await importGitHubDesignSystemProject(
-        githubUrl,
-        path.join(PROJECT_ROOT, '.tmp'),
-        USER_DESIGN_SYSTEMS_DIR,
-        {
-          ...(typeof body.name === 'string' ? { name: body.name } : {}),
-          ...(typeof body.branch === 'string' ? { branch: body.branch } : {}),
-          ...(importMode ? { importMode } : {}),
-          ...(craftApplies ? { craftApplies } : {}),
-          ...(platformUserForRequest(req)?.id ? { platformUserId: platformUserForRequest(req)!.id } : {}),
-          reservedIds: designSystemDirIdsFromCatalog(before),
-        },
-      );
+      const result = await importGitHubForRequest(req, githubUrl);
       const systems = await listAllDesignSystems();
       const designSystem = findUserDesignSystemInCatalog(systems, result.id);
       if (!designSystem) {
@@ -910,7 +931,7 @@ export function registerStaticResourceRoutes(app: Express, ctx: RegisterStaticRe
       const craftApplies = normalizeDesignSystemCraftApplies(body.craftApplies);
       const result = await importShadcnDesignSystemProject(
         reference,
-        path.join(PROJECT_ROOT, '.tmp'),
+        platform?.enabled ? path.join(RUNTIME_DATA_DIR, 'tmp') : path.join(PROJECT_ROOT, '.tmp'),
         USER_DESIGN_SYSTEMS_DIR,
         {
           ...(typeof body.name === 'string' ? { name: body.name } : {}),

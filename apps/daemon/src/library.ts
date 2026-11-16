@@ -39,7 +39,7 @@ export function libraryObjectsDir(libraryDir: string): string {
 
 /** Content-addressed path: <library>/objects/<hh>/<hash><ext>. */
 export function libraryObjectPath(libraryDir: string, contentHash: string, ext: string): string {
-  const shard = contentHash.slice(0, 2);
+  const shard = contentHash.replace(/^hosted-/, '').slice(0, 2);
   return path.join(libraryObjectsDir(libraryDir), shard, `${contentHash}${ext}`);
 }
 
@@ -274,6 +274,8 @@ export interface RegisterLibraryAssetInput {
    * mtime so the timeline reflects when the artifact was made, not synced.
    */
   capturedAt?: number | undefined;
+  /** Assigned by the server after checking the hosted session. */
+  platformUserId?: string | undefined;
   /** referenced-only metadata. */
   originProjectId?: string | undefined;
   relPath?: string | undefined;
@@ -309,19 +311,25 @@ export async function registerLibraryAsset(
     throw new Error('registerLibraryAsset requires bytes, text, or absPath');
   }
 
-  const contentHash = createHash('sha256').update(bytes).digest('hex');
+  const hash = createHash('sha256');
+  if (input.platformUserId) {
+    // Keep sidecars and content-addressed files private even for identical bytes.
+    hash.update(JSON.stringify([input.platformUserId, input.originProjectId, input.relPath]));
+  }
+  const contentHash = (input.platformUserId ? 'hosted-' : '') + hash.update(bytes).digest('hex');
 
-  // Dedup: same bytes already indexed → append source, union tags.
-  const existing = findLibraryAssetByHash(db, contentHash);
-  if (existing) {
+  const dedupe = (): RegisterLibraryAssetResult | undefined => {
+    const existing = findLibraryAssetByHash(db, contentHash);
+    if (!existing) return undefined;
     addLibraryAssetSource(db, { assetId: existing.id, ...input.source });
     if (input.tags && input.tags.length) {
       const merged = dedupeTags([...existing.tags, ...input.tags]);
       updateLibraryAsset(db, existing.id, { tags: merged });
     }
-    const refreshed = getLibraryAsset(db, existing.id) ?? existing;
-    return { asset: refreshed, deduped: true };
-  }
+    return { asset: getLibraryAsset(db, existing.id) ?? existing, deduped: true };
+  };
+  const existing = dedupe();
+  if (existing) return existing;
 
   if (!mime) mime = detectMime(bytes, input.filename);
   const kind = input.kind ?? kindForMime(mime);
@@ -338,6 +346,9 @@ export async function registerLibraryAsset(
     filePath = libraryObjectPath(libraryDir, contentHash, ext);
     await mkdir(path.dirname(filePath), { recursive: true });
     await writeFile(filePath, bytes);
+    // Another request may have indexed the identical file during the write.
+    const concurrent = dedupe();
+    if (concurrent) return concurrent;
   } else {
     // referenced: the bytes already live somewhere; point at the existing file.
     filePath = input.absPath;
@@ -356,6 +367,7 @@ export async function registerLibraryAsset(
     capturedAt,
     archivedDate: archivedDateFor(capturedAt),
     filePath,
+    platformUserId: input.platformUserId,
     originProjectId: input.originProjectId,
     relPath: input.relPath,
     mime,

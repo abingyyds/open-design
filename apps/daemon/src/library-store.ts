@@ -51,6 +51,7 @@ export function migrateLibrary(db: SqliteDb): void {
       metadata_json TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
+      platform_user_id TEXT,
       UNIQUE(content_hash)
     );
     CREATE INDEX IF NOT EXISTS idx_library_assets_archived
@@ -120,6 +121,14 @@ export function migrateLibrary(db: SqliteDb): void {
       created_at INTEGER NOT NULL
     );
   `);
+  db.transaction(() => {
+    const columns = db.prepare('PRAGMA table_info(library_assets)').all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === 'platform_user_id')) {
+      db.exec('ALTER TABLE library_assets ADD COLUMN platform_user_id TEXT');
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_library_assets_platform_user
+      ON library_assets(platform_user_id, archived_date DESC, created_at DESC)`);
+  }).immediate();
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +143,7 @@ const ASSET_COLS = `id, kind, storage, source_url AS sourceUrl,
   content_hash AS contentHash, caption, ocr_text AS ocrText,
   palette_json AS paletteJson, tags_json AS tagsJson,
   metadata_json AS metadataJson, created_at AS createdAt,
-  updated_at AS updatedAt`;
+  updated_at AS updatedAt, platform_user_id AS platformUserId`;
 
 interface RawAssetRow {
   id: string;
@@ -158,6 +167,7 @@ interface RawAssetRow {
   paletteJson: string | null;
   tagsJson: string | null;
   metadataJson: string | null;
+  platformUserId: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -175,6 +185,7 @@ function parseJson<T>(value: string | null | undefined, fallback: T): T {
 export interface LibraryAssetRecord extends LibraryAsset {
   /** Absolute path for owned assets; project-relative resolution otherwise. */
   filePath?: string;
+  platformUserId?: string;
 }
 
 function normalizeAsset(raw: RawAssetRow, sources: LibraryAssetSource[]): LibraryAssetRecord {
@@ -193,6 +204,7 @@ function normalizeAsset(raw: RawAssetRow, sources: LibraryAssetSource[]): Librar
     createdAt: Number(raw.createdAt),
     updatedAt: Number(raw.updatedAt),
   };
+  if (raw.platformUserId != null) asset.platformUserId = raw.platformUserId;
   if (raw.sourceUrl != null) asset.sourceUrl = raw.sourceUrl;
   if (raw.sourceTitle != null) asset.sourceTitle = raw.sourceTitle;
   if (raw.sourceDomain != null) asset.sourceDomain = raw.sourceDomain;
@@ -234,6 +246,7 @@ export interface InsertLibraryAssetInput {
   palette?: string[] | undefined;
   tags?: string[] | undefined;
   metadata?: Record<string, unknown> | undefined;
+  platformUserId?: string | undefined;
 }
 
 export function insertLibraryAsset(db: SqliteDb, input: InsertLibraryAssetInput): void {
@@ -243,8 +256,8 @@ export function insertLibraryAsset(db: SqliteDb, input: InsertLibraryAssetInput)
        (id, kind, storage, source_url, source_title, source_domain,
         captured_at, archived_date, file_path, origin_project_id, rel_path,
         mime, width, height, size, content_hash, caption, ocr_text,
-        palette_json, tags_json, metadata_json, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        palette_json, tags_json, metadata_json, created_at, updated_at, platform_user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.id,
     input.kind,
@@ -269,6 +282,7 @@ export function insertLibraryAsset(db: SqliteDb, input: InsertLibraryAssetInput)
     input.metadata ? JSON.stringify(input.metadata) : null,
     now,
     now,
+    input.platformUserId ?? null,
   );
 }
 
@@ -333,13 +347,14 @@ export function findReferencedAssetByOrigin(
   db: SqliteDb,
   originProjectId: string,
   relPath: string,
+  platformUserId?: string,
 ): LibraryAssetRecord | null {
   const raw = db
     .prepare(
       `SELECT ${ASSET_COLS} FROM library_assets
-        WHERE origin_project_id = ? AND rel_path = ? LIMIT 1`,
+        WHERE origin_project_id = ? AND rel_path = ? AND platform_user_id IS ? LIMIT 1`,
     )
-    .get(originProjectId, relPath) as RawAssetRow | undefined;
+    .get(originProjectId, relPath, platformUserId ?? null) as RawAssetRow | undefined;
   if (!raw) return null;
   return normalizeAsset(raw, listLibraryAssetSources(db, raw.id));
 }
@@ -363,9 +378,13 @@ export function deleteLibraryAsset(db: SqliteDb, id: string): void {
   db.prepare(`DELETE FROM library_assets WHERE id = ?`).run(id);
 }
 
-export function listLibraryAssets(db: SqliteDb, filter: LibraryAssetFilter = {}): LibraryAssetRecord[] {
-  const where: string[] = [];
-  const args: unknown[] = [];
+export function listLibraryAssets(
+  db: SqliteDb,
+  filter: LibraryAssetFilter = {},
+  platformUserId?: string,
+): LibraryAssetRecord[] {
+  const where = ['a.platform_user_id IS ?'];
+  const args: unknown[] = [platformUserId ?? null];
   if (filter.kind) {
     where.push('a.kind = ?');
     args.push(filter.kind);
@@ -403,7 +422,7 @@ export function listLibraryAssets(db: SqliteDb, filter: LibraryAssetFilter = {})
     where.push('EXISTS (SELECT 1 FROM library_asset_sources s WHERE s.asset_id = a.id AND s.design_system_id = ?)');
     args.push(filter.designSystemId);
   }
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const whereSql = `WHERE ${where.join(' AND ')}`;
   const limit = Number.isFinite(filter.limit) ? Math.max(1, Math.min(Number(filter.limit), 1000)) : 500;
   const raws = db
     .prepare(

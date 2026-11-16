@@ -501,8 +501,20 @@ export interface CloudflarePagesCustomDomainInfo {
   dnsOwnership?: CloudflarePagesDnsOwnership;
   domainStatus?: CloudflarePagesDomainStatus;
   pagesDomainStatus?: string;
+  bindingVerifiedAt?: number;
   validationData?: unknown;
   verificationData?: unknown;
+}
+
+export const CLOUDFLARE_PAGES_BINDING_TTL_MS = 60 * 60 * 1000;
+
+export function hasFreshCloudflarePagesBinding(
+  domain: { pagesDomainStatus?: unknown; bindingVerifiedAt?: unknown },
+  now = Date.now(),
+): boolean {
+  const verifiedAt = domain.bindingVerifiedAt;
+  return String(domain.pagesDomainStatus || '').toLowerCase() === 'active'
+    && typeof verifiedAt === 'number' && verifiedAt <= now && now - verifiedAt < CLOUDFLARE_PAGES_BINDING_TTL_MS;
 }
 
 export interface CloudflarePagesDeploymentInfo {

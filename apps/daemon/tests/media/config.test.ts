@@ -1034,6 +1034,30 @@ describe('seedProviderIfMissing', () => {
     return JSON.parse(raw);
   }
 
+  it('blocks hosted BYOK seeding and ignores shared stored media destinations', async () => {
+    const stored = {
+      providers: { openai: { apiKey: 'fixture-shared-key', baseUrl: 'https://stored.example.test' } },
+      aliases: { 'fixture-model': 'stored-model' },
+    };
+    await writeStored(stored);
+    vi.stubEnv('OD_PLATFORM_ENABLED', '1');
+    vi.stubEnv('OPENAI_API_KEY', 'fixture-operator-key');
+    try {
+      expect(await seedProviderIfMissing(projectRoot, 'senseaudio', {
+        apiKey: 'fixture-byok-key', baseUrl: 'https://byok.example.test',
+      })).toBe(false);
+      expect(await readStoredJson()).toEqual(stored);
+      expect(await resolveProviderConfig(projectRoot, 'openai')).toEqual({
+        apiKey: 'fixture-operator-key', baseUrl: '',
+      });
+      expect(await resolveModelAlias(projectRoot, 'fixture-model')).toBe('fixture-model');
+      vi.stubEnv('OPENAI_API_KEY', undefined);
+      expect(await resolveProviderConfig(projectRoot, 'openai')).toEqual({ apiKey: '', baseUrl: '' });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('writes a fresh entry when the slot is empty', async () => {
     const wrote = await seedProviderIfMissing(projectRoot, 'senseaudio', {
       apiKey: 'sa-test-key',

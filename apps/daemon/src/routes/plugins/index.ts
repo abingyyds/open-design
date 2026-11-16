@@ -90,6 +90,7 @@ interface PluginRouteHelpers {
 }
 
 export interface RegisterPluginRoutesDeps {
+  platform?: { enabled: boolean };
   db: SqliteDbLike;
   paths: { PROJECTS_DIR: string; PLUGIN_REGISTRY_ROOTS: string[]; PLUGIN_LOCKFILE_PATH: string };
   plugins: {
@@ -146,6 +147,12 @@ export function registerPluginEventRoutes(app: Express, deps: RegisterPluginEven
 
 export function registerPluginRoutes(app: Express, deps: RegisterPluginRoutesDeps): void {
   const { db, paths, plugins, helpers } = deps;
+  if (deps.platform?.enabled) {
+    app.use(['/api/plugins', '/api/marketplaces', '/api/applied-plugins'], (req, res, next) => {
+      if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+      return helpers.sendApiError(res, 403, 'FORBIDDEN', 'The shared plugin catalog is read-only in hosted mode');
+    });
+  }
   app.get('/api/plugins', async (_req, res) => { try { res.json({ plugins: helpers.applyBakedPreviews(plugins.listInstalledPlugins(db), helpers.PLUGIN_PREVIEWS_DIR) }); } catch (err) { res.status(500).json({ error: String(err) }); } });
   app.get('/api/plugins/:id', async (req, res) => { try { const plugin = plugins.getInstalledPlugin(db, req.params.id); if (!plugin) return res.status(404).json({ error: 'plugin not found' }); res.json(plugin); } catch (err) { res.status(500).json({ error: String(err) }); } });
   app.post('/api/plugins/upload-zip', (req, res) => helpers.pluginUpload.single('file')(req, res, async (err: unknown) => { if (err) return helpers.sendMulterError(res, err); try { const file = req.file; if (!file?.buffer) return res.status(400).json({ error: 'file is required' }); const result = await helpers.pluginInstallation.stageUploadedPluginZip(file.buffer, `upload:zip:${helpers.decodeMultipartFilename(file.originalname || 'plugin.zip')}`); res.status((result as { ok?: boolean }).ok ? 200 : 400).json(result); } catch (uploadErr: unknown) { res.status(400).json({ ok: false, warnings: [], message: uploadErr instanceof Error ? uploadErr.message : String(uploadErr), log: [] }); } }));
@@ -168,7 +175,12 @@ export function registerPluginRoutes(app: Express, deps: RegisterPluginRoutesDep
 
 export function registerProjectPluginRoutes(app: Express, deps: RegisterPluginRoutesDeps): void {
   const { db, paths, plugins, helpers } = deps;
-  app.post('/api/projects/:id/plugins/install-folder', async (req, res) => helpers.handleProjectInstallFolder(req, res));
+  app.post('/api/projects/:id/plugins/install-folder', async (req, res) => {
+    if (deps.platform?.enabled) {
+      return helpers.sendApiError(res, 403, 'FORBIDDEN', 'The shared plugin catalog is read-only in hosted mode');
+    }
+    return helpers.handleProjectInstallFolder(req, res);
+  });
   app.post('/api/projects/:id/plugins/publish-github', async (req, res) => helpers.handleProjectPluginCli(req, res, 'publish-github'));
   app.get('/api/projects/:id/plugin-candidates', (req, res) => { try { const project = helpers.getProject(db, req.params.id); if (!project) return helpers.sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found'); const includeDismissed = req.query.includeDismissed === 'true'; res.json({ candidates: plugins.listSkillPluginCandidates(db, req.params.id, includeDismissed) }); } catch (err: unknown) { res.status(400).json({ error: err instanceof Error ? err.message : String(err) }); } });
   app.post('/api/projects/:id/plugin-candidates/:candidateId/dismiss', (req, res) => { if (!helpers.isLocalSameOrigin(req, helpers.resolvedPortRef.current)) return res.status(403).json({ error: 'cross-origin request rejected' }); const candidate = plugins.dismissSkillPluginCandidate(db, req.params.id, req.params.candidateId); if (!candidate) return helpers.sendApiError(res, 404, 'NOT_FOUND', 'plugin candidate not found'); if (candidate.assistantMessageId) db.prepare(`DELETE FROM messages WHERE id = ?`).run(candidate.assistantMessageId); res.json({ ok: true, candidate }); });

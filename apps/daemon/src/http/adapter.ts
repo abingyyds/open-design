@@ -30,6 +30,7 @@ export function mountJsonRoute<Input, Output, Deps>(
   spec: JsonRouteSpec<Input, Output, Deps>,
   deps: Deps,
   adapter: AdapterContext,
+  requestDeps?: (req: Request) => Deps,
 ): void {
   app[spec.method](spec.path, async (req: Request, res: Response) => {
     try {
@@ -45,7 +46,7 @@ export function mountJsonRoute<Input, Output, Deps>(
         sendApiError(res, statusForError(parsed.error), parsed.error);
         return;
       }
-      const result = await spec.handle(parsed.value, deps);
+      const result = await spec.handle(parsed.value, requestDeps?.(req) ?? deps);
       if (!result.ok) {
         sendApiError(res, statusForError(result.error), result.error);
         return;

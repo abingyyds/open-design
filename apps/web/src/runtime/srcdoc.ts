@@ -14,6 +14,7 @@
  *   { type: 'od:slide-state', active: number, count: number }
  * after every navigation so the host can render its own counter / dots.
  */
+import { HOSTED_PREVIEW_CONTENT_POLICY } from '@open-design/contracts';
 import {
   buildManualEditBridge,
   buildManualEditBridgeStyle,
@@ -23,6 +24,7 @@ import {
 } from '../edit-mode/bridge';
 
 export type SrcdocOptions = {
+  hosted?: boolean;
   deck?: boolean;
   baseHref?: string;
   initialSlideIndex?: number;
@@ -34,6 +36,12 @@ export type SrcdocOptions = {
   initialPalette?: string | null;
   previewFocusGuard?: boolean;
 };
+
+function protectHostedSrcdoc(html: string): string {
+  // Place the policy before any authored markup or generated bridge.
+  const body = html.replace(/^\s*<!doctype\s+html\s*>/i, '');
+  return `<!doctype html><meta http-equiv="Content-Security-Policy" content="${HOSTED_PREVIEW_CONTENT_POLICY}; base-uri 'self'">${body}`;
+}
 
 /**
  * Sanitize a document title string so the resulting PDF filename is accepted by
@@ -285,9 +293,10 @@ export function buildSrcdoc(
   // it to a per-call option would force iframe srcdoc regeneration (and a
   // visible flash) every time the host toggle flips.
   const withTweaks = injectTweaksBridge(withEdit);
-  return injectSrcdocTransportActivationBridge(
+  const document = injectSrcdocTransportActivationBridge(
     injectExportCaptureBridge(injectSnapshotBridge(withTweaks)),
   );
+  return options.hosted ? protectHostedSrcdoc(document) : document;
 }
 
 /**
@@ -303,8 +312,8 @@ export function buildSrcdoc(
  *      key-driven re-mount), in which case the message is dropped and the
  *      iframe stays stuck on the empty shell. See #2253.
  */
-export function buildLazySrcdocTransport(): string {
-  return `<!doctype html>
+export function buildLazySrcdocTransport(hosted = false): string {
+  const document = `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -326,6 +335,7 @@ export function buildLazySrcdocTransport(): string {
   </head>
   <body></body>
 </html>`;
+  return hosted ? protectHostedSrcdoc(document) : document;
 }
 
 export interface SrcDocActivationInputs {

@@ -43,7 +43,9 @@ import {
 } from '../integrations/xai-tokens.js';
 import type { RouteDeps } from '../server-context.js';
 
-export interface RegisterXaiRoutesDeps extends RouteDeps<'http' | 'paths'> {}
+export interface RegisterXaiRoutesDeps extends RouteDeps<'http' | 'paths'> {
+  platform?: { enabled: boolean };
+}
 
 function fetchWithRequestInit(
   requestInit: Pick<RequestInit, 'dispatcher'>,
@@ -52,7 +54,12 @@ function fetchWithRequestInit(
 }
 
 export function registerXaiRoutes(app: Express, ctx: RegisterXaiRoutesDeps) {
-  const { isLocalSameOrigin, resolvedPortRef } = ctx.http;
+  const { isLocalSameOrigin, resolvedPortRef, sendApiError } = ctx.http;
+  if (ctx.platform?.enabled) {
+    app.use(['/api/xai/oauth', '/api/xai/auth/status'], (_req, res) =>
+      sendApiError(res, 403, 'FORBIDDEN', 'Shared xAI authorization is unavailable in hosted mode'),
+    );
+  }
   const { PROJECT_ROOT } = ctx.paths;
   const getResolvedPort = () => resolvedPortRef.current;
 

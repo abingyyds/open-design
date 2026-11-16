@@ -1,4 +1,7 @@
-import type { Express } from 'express';
+import { setHostedDownloadHeaders, setHostedPreviewHeaders } from '../http/hosted-file-response.js';
+import type { HostedPreviewRoutes } from '../http/hosted-preview.js';
+import { resolveDesignSystemStaticFile } from '../design-systems/index.js';
+import type { Express, Request, Response } from 'express';
 import fsp from 'node:fs/promises';
 import type { RouteDeps } from '../server-context.js';
 import type {
@@ -31,6 +34,7 @@ type AvailableDesignSystemSummary = DesignSystemSummary & {
 
 export interface RegisterDesignSystemRoutesDeps extends RouteDeps<'db' | 'paths' | 'projectFiles' | 'projectStore'> {
   platform?: { enabled?: boolean; currentUser?: (req: unknown) => { id?: string } | null };
+  hostedPreview?: HostedPreviewRoutes;
   designSystems: {
     buildUserDesignSystemArchive: (
       root: string,
@@ -50,7 +54,7 @@ export interface RegisterDesignSystemRoutesDeps extends RouteDeps<'db' | 'paths'
       contentType: string;
       updatedAt: string;
     } | null>;
-    readDesignSystemWorkspaceTextFile: (db: DbHandle, summary: AvailableDesignSystemSummary | undefined, filePath: string) => Promise<string | null>;
+    readDesignSystemWorkspaceTextFile: (db: DbHandle, summary: AvailableDesignSystemSummary | undefined, filePath: string, platformUserId?: string | null) => Promise<string | null>;
     readUserDesignSystemFile: (root: string, id: string, filePath: string) => Promise<DesignSystemFileDetail | null>;
     renderDesignSystemPreview: (id: string, body: string) => string;
     renderDesignSystemShowcase: (id: string, body: string) => string;
@@ -252,7 +256,8 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
       if (!summary || !platformDesignSystemVisible(req, summary)) {
         return res.status(404).json({ error: 'design system not found' });
       }
-      const projectBody = await readDesignSystemWorkspaceTextFile(db, summary, 'DESIGN.md');
+      const platformUserId = platform?.enabled ? platform.currentUser?.(req)?.id ?? null : undefined;
+      const projectBody = await readDesignSystemWorkspaceTextFile(db, summary, 'DESIGN.md', platformUserId);
       const body = projectBody ?? await readAvailableDesignSystem(req.params.id);
       if (body === null) {
         return res.status(404).json({ error: 'design system not found' });
@@ -272,6 +277,7 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
       const body = await readAvailableDesignSystem(req.params.id);
       if (body === null) return res.status(404).type('text/plain').send('not found');
       const html = renderDesignSystemPreview(req.params.id, body);
+      if (platform?.enabled) setHostedPreviewHeaders(res);
       res.type('text/html').send(html);
     } catch (err) {
       res.status(500).type('text/plain').send(String(err));
@@ -284,24 +290,48 @@ export function registerDesignSystemRoutes(app: Express, ctx: RegisterDesignSyst
       const body = await readAvailableDesignSystem(req.params.id);
       if (body === null) return res.status(404).type('text/plain').send('not found');
       const html = renderDesignSystemShowcase(req.params.id, body);
+      if (platform?.enabled) setHostedPreviewHeaders(res);
       res.type('text/html').send(html);
     } catch (err) {
       res.status(500).type('text/plain').send(String(err));
     }
   });
 
-  app.get('/api/design-systems/:id/static', async (req, res) => {
+  async function serveDesignSystemFile(req: Request, res: Response, id: string, requestedPath: string, preview: boolean) {
     try {
-      if (!(await requireVisibleDesignSystem(req, res, req.params.id))) return;
-      const requestedPath = typeof req.query.path === 'string' ? req.query.path : '';
-      const file = await readAvailableDesignSystemStaticFile(req.params.id, requestedPath);
+      const summary = await requireVisibleDesignSystem(req, res, id);
+      if (!summary) return;
+      if (platform?.enabled && preview) {
+        const ownerId = platform.currentUser?.(req)?.id;
+        if (!ctx.hostedPreview || !ownerId) return res.sendStatus(404);
+        const userPackage = summary.source === 'user';
+        const root = userPackage ? USER_DESIGN_SYSTEMS_DIR : ctx.paths.DESIGN_SYSTEMS_DIR;
+        const options = userPackage ? { idPrefix: 'user:', ownerId } : undefined;
+        return await ctx.hostedPreview.redirect(req, res, requestedPath, async (name) => {
+          const file = await resolveDesignSystemStaticFile(root, id, name, options);
+          return file ? { filePath: file.filePath, size: file.size, mime: file.contentType } : null;
+        });
+      }
+      const file = await readAvailableDesignSystemStaticFile(id, requestedPath);
       if (!file) return res.status(404).type('text/plain').send('not found');
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Last-Modified', file.updatedAt);
+      if (platform?.enabled) setHostedDownloadHeaders(res, file.contentType);
       res.type(file.contentType).send(file.bytes);
     } catch (err) {
       res.status(500).type('text/plain').send(String(err));
     }
+  }
+
+  app.get('/api/design-systems/:id/static', (req, res) => {
+    const requestedPath = typeof req.query.path === 'string' ? req.query.path : '';
+    return serveDesignSystemFile(req, res, req.params.id, requestedPath, false);
+  });
+
+  app.get('/api/design-systems/:id/preview-files/*file', (req, res) => {
+    const params = req.params as { id: string; file: string | string[] };
+    const requestedPath = Array.isArray(params.file) ? params.file.join('/') : params.file;
+    return serveDesignSystemFile(req, res, params.id, requestedPath, true);
   });
 
   app.post('/api/design-systems/:id/workspace', async (req, res) => {

@@ -49,6 +49,9 @@ import { I18nProvider } from '../../src/i18n';
 import type { Dict } from '../../src/i18n/types';
 import { emptyManualEditStyles } from '../../src/edit-mode/types';
 import { readExpandedIndexCss } from '../helpers/read-expanded-css';
+import { HostedPlatformContext } from '../../src/providers/platform';
+import { CLOUDFLARE_PAGES_BINDING_TTL_MS, HOSTED_PREVIEW_NAVIGATION_PATTERN } from '@open-design/contracts';
+import HostedPreviewPresentation from '../../app/preview-presentation/page';
 
 const TEST_SNAPSHOT_DATA_URL = 'data:image/png;base64,c25hcHNob3Q=';
 
@@ -784,6 +787,291 @@ describe('FileViewer SVG artifacts', () => {
     expect(markup).toContain('data-od-render-mode="srcdoc" data-od-active="false"');
     expect(markup).toContain('src="/api/projects/project-1/raw/page.html?v=1710000000&amp;r=0&amp;odPreviewBridge=scroll&amp;odPreviewBridge=selection&amp;odPreviewBridge=snapshot"');
     expect(markup).toContain('sandbox="allow-scripts allow-downloads"');
+  });
+
+  it('loads the hosted HTML viewer through the isolated preview route', () => {
+    const file = baseFile({ name: 'nested/page.html', kind: 'html', mime: 'text/html' });
+    render(
+      <HostedPlatformContext.Provider value={true}>
+        <FileViewer projectId="project-1" projectKind="prototype" file={file} liveHtml="<h1>Preview fixture</h1>" />
+      </HostedPlatformContext.Provider>,
+    );
+    const iframe = screen.getByTestId('artifact-preview-frame');
+    expect(iframe.getAttribute('src')).toMatch(/\/api\/projects\/project-1\/preview-files\/nested\/page\.html\?v=1710000000&r=0&odPreviewBridge=scroll&odPreviewBridge=selection&odPreviewBridge=snapshot&odPreviewNavigation=\d{13}\.[a-f0-9]{32}$/u);
+    expect(iframe.getAttribute('sandbox')).toBe('allow-scripts');
+  });
+
+  it('updates the parent navigation binding on hosted file refresh', async () => {
+    const file = baseFile({ name: 'nested/page.html', kind: 'html', mime: 'text/html' });
+    const viewer = (filesRefreshKey: number) => (
+      <HostedPlatformContext.Provider value={true}>
+        <FileViewer projectId="project-1" projectKind="prototype" file={file} filesRefreshKey={filesRefreshKey} liveHtml="<h1>Preview fixture</h1>" />
+      </HostedPlatformContext.Provider>
+    );
+    const { rerender } = render(viewer(0));
+    const frame = screen.getByTestId('artifact-preview-frame') as HTMLIFrameElement;
+    const navigation = () => new URL(frame.src).searchParams.get('odPreviewNavigation');
+    const previous = navigation();
+    expect(previous).toMatch(HOSTED_PREVIEW_NAVIGATION_PATTERN);
+
+    rerender(viewer(1));
+    await waitFor(() => expect(new URL(frame.src).searchParams.get('fr')).toBe('1'));
+    expect(navigation()).toMatch(HOSTED_PREVIEW_NAVIGATION_PATTERN);
+    expect(navigation()).not.toBe(previous);
+  });
+
+  it('opens a hosted presentation with a scoped sandboxed iframe in the new tab', async () => {
+    const open = vi.spyOn(window, 'open').mockReturnValue(null);
+    const file = baseFile({ name: 'nested/design preview.html', kind: 'html', mime: 'text/html' });
+    render(
+      <HostedPlatformContext.Provider value={true}>
+        <FileViewer projectId="project-1" projectKind="prototype" file={file} liveHtml="<h1>Presentation</h1>" />
+      </HostedPlatformContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /^present$/i }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /new tab/i }));
+    const [url, target, features] = open.mock.calls[0]!;
+    expect(String(url)).toMatch(/^\/preview-presentation\/\?/u);
+    expect(target).toBe('_blank');
+    expect(features).toBe('noopener,noreferrer');
+    const previousUrl = window.location.href;
+    try {
+      window.history.replaceState(null, '', String(url));
+      render(<HostedPreviewPresentation />);
+      const frame = await screen.findByTitle('Presentation');
+      expect(frame.getAttribute('src')).toMatch(/\/api\/projects\/project-1\/preview-files\/nested\/design%20preview\.html\?odPreviewNavigation=\d{13}\.[a-f0-9]{32}$/u);
+      expect(frame.getAttribute('sandbox')).toBe('allow-scripts');
+      expect(frame.hasAttribute('srcdoc')).toBe(false);
+    } finally {
+      window.history.replaceState(null, '', previousUrl);
+    }
+  });
+
+  it('keeps the hosted inline preview sandbox and reopens its asset scope after returning from the background', async () => {
+    const scopedUrl = `/api/hosted-preview/${'a'.repeat(32)}/nested/page.html`;
+    const replacement = `/api/hosted-preview/${'b'.repeat(32)}/nested/page.html`;
+    let issued = 0;
+    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/renew')) return new Response(null, { status: 404 });
+      if (!url.includes('/preview-url?')) return new Response('{}', { status: 200 });
+      return Response.json({ url: issued++ === 0 ? scopedUrl : replacement });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const file = baseFile({ name: 'nested/page.html', kind: 'html', mime: 'text/html' });
+    render(
+      <HostedPlatformContext.Provider value={true}>
+        <FileViewer projectId="project-1" projectKind="prototype" file={file}
+          liveHtml={'<h1>Fixture</h1><img src="icon.png"><script>localStorage.getItem("theme")</script>'} />
+      </HostedPlatformContext.Provider>,
+    );
+    const frame = screen.getByTestId('artifact-preview-frame');
+    await waitFor(() => expect(frame.getAttribute('srcdoc')).toContain(`<base href="${scopedUrl}"`));
+    expect(frame.getAttribute('srcdoc')).toContain("connect-src 'none'");
+    expect(frame.getAttribute('sandbox')).toBe('allow-scripts');
+    fireEvent(document, new Event('visibilitychange'));
+    expect(fetchMock.mock.calls.some(([url]) => url.endsWith('/renew'))).toBe(false);
+    hidden.mockReturnValue(false);
+    fireEvent(document, new Event('visibilitychange'));
+    await waitFor(() => expect(frame.getAttribute('srcdoc')).toContain(`<base href="${replacement}"`));
+    expect(issued).toBe(2);
+  });
+
+  it('uses bounded source reads when a hosted HTML preview opens', async () => {
+    const fetchMock = vi.fn(async (url: string) => url.includes('/preview-source?')
+      ? new Response('', { status: 413 })
+      : new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const file = baseFile({ name: 'large.html', kind: 'html', mime: 'text/html' });
+    render(
+      <HostedPlatformContext.Provider value={true}>
+        <FileViewer projectId="project-1" projectKind="prototype" file={file} />
+      </HostedPlatformContext.Provider>,
+    );
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => url.includes('/preview-source?file=large.html'))).toBe(true));
+    expect(fetchMock.mock.calls.some(([url]) => url.includes('/raw/large.html'))).toBe(false);
+  });
+
+  it('automatically retries busy hosted source and scope requests', async () => {
+    const scopedUrl = `/api/hosted-preview/${'a'.repeat(32)}/index.html`;
+    let sourceRequests = 0;
+    let scopeRequests = 0;
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/preview-source?')) {
+        if (++sourceRequests === 1) return new Response(null, { status: 429 });
+        return new Response('<h1>Recovered preview</h1><script>localStorage.getItem("theme")</script>');
+      }
+      if (url.includes('/preview-url?')) {
+        if (++scopeRequests === 1) return new Response(null, { status: 429 });
+        return Response.json({ url: scopedUrl });
+      }
+      return new Response(null, { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const file = baseFile({ name: 'index.html', kind: 'html', mime: 'text/html' });
+    render(
+      <HostedPlatformContext.Provider value={true}>
+        <FileViewer projectId="project-1" projectKind="prototype" file={file} />
+      </HostedPlatformContext.Provider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('artifact-preview-frame').getAttribute('srcdoc'))
+      .toContain(`<base href="${scopedUrl}"`));
+    expect(sourceRequests).toBe(2);
+    expect(scopeRequests).toBe(2);
+    expect(fetchMock.mock.calls.some(([url]) => url.includes('/raw/'))).toBe(false);
+  });
+
+  it('provides a manual retry when the hosted source remains busy', async () => {
+    let busy = true;
+    let reads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/preview-source?')) {
+        reads++;
+        return busy ? new Response(null, { status: 429 }) : new Response('<h1>Ready</h1>');
+      }
+      return new Response(null, { status: 404 });
+    }));
+    const file = baseFile({ name: 'index.html', kind: 'html', mime: 'text/html' });
+    render(
+      <HostedPlatformContext.Provider value={true}>
+        <FileViewer projectId="project-1" projectKind="prototype" file={file} />
+      </HostedPlatformContext.Provider>,
+    );
+    const retry = await screen.findByRole('button', { name: /^retry$/i }, { timeout: 3000 });
+    expect(reads).toBe(4);
+    busy = false;
+    fireEvent.click(retry);
+    expect(await screen.findByTestId('artifact-preview-frame')).toBeTruthy();
+    expect(reads).toBe(5);
+  });
+
+  it.each([
+    { name: 'pending', custom: { status: 'pending' } },
+    { name: 'stale', custom: { status: 'ready', pagesDomainStatus: 'active', bindingVerifiedAt: 1 } },
+  ])('opens the ready Pages share link while the custom domain is $name', async ({ custom }) => {
+    const file = baseFile({ name: 'index.html', kind: 'html', mime: 'text/html' });
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      deployments: [{
+        id: 'cloudflare-preview', projectId: 'project-1', fileName: 'index.html', providerId: 'cloudflare-pages',
+        url: 'https://fixture.pages.dev', status: 'link-delayed', createdAt: 1, updatedAt: 2,
+        cloudflarePages: {
+          pagesDev: { url: 'https://fixture.pages.dev', status: 'ready' },
+          customDomain: { url: 'https://fixture.example.test', ...custom },
+        },
+      }],
+    }), { status: 200 })));
+    render(
+      <HostedPlatformContext.Provider value={true}>
+        <FileViewer projectId="project-1" projectKind="prototype" file={file} liveHtml="<h1>Fixture</h1>" />
+      </HostedPlatformContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /share/i }));
+    const openSharePage = await screen.findByRole('menuitem', { name: /Open share page/i }) as HTMLButtonElement;
+    await waitFor(() => expect(openSharePage.disabled).toBe(false));
+    fireEvent.click(openSharePage);
+    expect(openSpy).toHaveBeenCalledWith('https://fixture.pages.dev', '_blank', 'noopener');
+  });
+
+  it('falls back to Pages across an open hosted deployment and social share dialog when binding proof expires', async () => {
+    const file = baseFile({ name: 'index.html', kind: 'html', mime: 'text/html' });
+    const customUrl = 'https://fixture.example.test';
+    const pagesUrl = 'https://fixture.pages.dev';
+    const now = Date.now();
+    const bindingVerifiedAt = now - CLOUDFLARE_PAGES_BINDING_TTL_MS + 60_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    const clipboard = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: clipboard } });
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/deployments')) return Response.json({
+        deployments: [{
+          id: 'cloudflare-preview', projectId: 'project-1', fileName: 'index.html', providerId: 'cloudflare-pages',
+          url: pagesUrl, status: 'ready', createdAt: 1, updatedAt: 2,
+          cloudflarePages: {
+            pagesDev: { url: pagesUrl, status: 'ready' },
+            customDomain: { url: customUrl, status: 'ready', pagesDomainStatus: 'active', bindingVerifiedAt },
+          },
+        }],
+      });
+      return new Response(null, { status: 404 });
+    }));
+    render(
+      <HostedPlatformContext.Provider value={true}>
+        <FileViewer projectId="project-1" projectKind="prototype" file={file} liveHtml="<h1>Fixture</h1>" />
+      </HostedPlatformContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /share/i }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: /social share/i }));
+    const dialog = await screen.findByRole('dialog');
+    const customCard = await waitFor(() => {
+      const link = dialog.querySelector<HTMLAnchorElement>(`.deploy-result-url[href="${customUrl}"]`);
+      expect(link).not.toBeNull();
+      return link!.closest<HTMLElement>('.deploy-result-link')!;
+    });
+    const social = await within(dialog).findByRole('link', { name: 'X' });
+    expect(new URL((social as HTMLAnchorElement).href).searchParams.get('url')).toBe(new URL(customUrl).href);
+    const copy = within(customCard).getByRole('button', { name: /copy/i });
+    clock.mockReturnValue(bindingVerifiedAt + CLOUDFLARE_PAGES_BINDING_TTL_MS);
+    fireEvent.click(customCard.querySelector('.deploy-result-url')!);
+    expect(openSpy).toHaveBeenCalledWith(pagesUrl, '_blank', 'noopener,noreferrer');
+    fireEvent.click(copy);
+    expect(clipboard).toHaveBeenCalledWith(pagesUrl);
+    fireEvent.click(social);
+    const opened = String(openSpy.mock.calls.at(-1)?.[0]);
+    expect(new URL(opened).searchParams.get('url')).toBe(new URL(pagesUrl).href);
+    clock.mockReturnValue(now);
+    fireEvent.click(screen.getByRole('button', { name: /share/i }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: /social share/i }));
+    const updatedDialog = await screen.findByRole('dialog');
+    expect(updatedDialog.querySelector(`a[href="${customUrl}"]`)).not.toBeNull();
+    clock.mockReturnValue(bindingVerifiedAt + CLOUDFLARE_PAGES_BINDING_TTL_MS);
+    fireEvent(document, new Event('visibilitychange'));
+    expect(updatedDialog.querySelector(`a[href="${customUrl}"]`)).toBeNull();
+    expect(updatedDialog.querySelector(`a[href="${pagesUrl}"]`)).not.toBeNull();
+  });
+
+  it.each([false, true])('skips the failed hosted Pages fallback after expiry with an older ready deployment = %s', async (hasOlderDeployment) => {
+    const file = baseFile({ name: 'index.html', kind: 'html', mime: 'text/html' });
+    const now = Date.now();
+    const boundAt = now - CLOUDFLARE_PAGES_BINDING_TTL_MS + 60_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const olderUrl = 'https://older-fixture.vercel.app';
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (!url.endsWith('/deployments')) return new Response(null, { status: 404 });
+      return Response.json({
+        deployments: [{
+          id: 'cloudflare-failed-pages', projectId: 'project-1', fileName: 'index.html', providerId: 'cloudflare-pages',
+          url: 'https://failed-fixture.pages.dev', status: 'link-delayed', createdAt: 1, updatedAt: 2,
+          cloudflarePages: {
+            pagesDev: { url: 'https://failed-fixture.pages.dev', status: 'failed' },
+            customDomain: {
+              url: 'https://custom.example.test', status: 'ready',
+              pagesDomainStatus: 'active', bindingVerifiedAt: boundAt,
+            },
+          },
+        }, ...(hasOlderDeployment ? [{
+          id: 'older-deployment', projectId: 'project-1', fileName: 'index.html', providerId: 'vercel-self',
+          url: olderUrl, status: 'ready', createdAt: 1, updatedAt: 1,
+        }] : [])],
+      });
+    }));
+    render(
+      <HostedPlatformContext.Provider value={true}>
+        <FileViewer projectId="project-1" projectKind="prototype" file={file} liveHtml="<h1>Fixture</h1>" />
+      </HostedPlatformContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /share/i }));
+    const copy = await screen.findByRole('menuitem', { name: /copy share link/i });
+    clock.mockReturnValue(boundAt + CLOUDFLARE_PAGES_BINDING_TTL_MS);
+    fireEvent.click(copy);
+    if (hasOlderDeployment) expect(writeText).toHaveBeenCalledExactlyOnceWith(olderUrl);
+    else expect(writeText).not.toHaveBeenCalled();
+    fireEvent(document, new Event('visibilitychange'));
+    if (hasOlderDeployment) expect(screen.getByRole('menuitem', { name: /open share page/i })).toBeTruthy();
+    else expect(screen.queryByRole('menuitem', { name: /copy share link/i })).toBeNull();
   });
 
   it('does not treat slide-prefixed helper classes as deck slides', () => {

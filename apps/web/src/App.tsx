@@ -15,6 +15,7 @@ import {
   fidelityToTracking,
 } from '@open-design/contracts/analytics';
 import type { AmrModelsResponse, ChatSessionMode } from '@open-design/contracts';
+import { keepFramedPreviewsAlive } from './runtime/hosted-preview-session';
 import { EntryView } from './components/EntryView';
 import type { IntegrationTab } from './components/IntegrationsView';
 import { MarketplaceView } from './components/MarketplaceView';
@@ -66,6 +67,7 @@ import {
 import {
   fetchPlatformModels,
   fetchPlatformStatus,
+  HostedPlatformContext,
   loginPlatform,
   logoutPlatform,
   setPlatformModel,
@@ -407,6 +409,10 @@ function AppInner() {
   platformStateRef.current = platformState;
   const platformReadyForApp =
     platformState.loaded && (!platformState.enabled || platformState.authenticated);
+  useEffect(() => {
+    if (!platformState.enabled || !platformState.authenticated) return;
+    return keepFramedPreviewsAlive();
+  }, [platformState.enabled, platformState.authenticated]);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const platformAwareAgents = useMemo(() => {
     if (!platformState.enabled || !platformState.authenticated) return agents;
@@ -2564,7 +2570,9 @@ function AppInner() {
           />
         ) : null}
         <div className="workspace-shell__body">
-          {appMain}
+          <HostedPlatformContext.Provider value={platformState.enabled}>
+            {appMain}
+          </HostedPlatformContext.Provider>
         </div>
       </div>
       {clientType === 'desktop' ? null : (

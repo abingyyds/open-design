@@ -1,4 +1,6 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { HOSTED_PREVIEW_SANDBOX } from '@open-design/contracts';
+import { HostedPlatformContext } from '../providers/platform';
 import { useT } from '../i18n';
 import { copyToClipboard } from '../lib/copy-to-clipboard';
 import {
@@ -264,6 +266,7 @@ export function PreviewModal({
   onSharePopoverItemClick,
 }: Props) {
   const t = useT();
+  const hosted = useContext(HostedPlatformContext);
   const initial = initialViewId && views.some((v) => v.id === initialViewId)
     ? initialViewId
     : views[0]?.id ?? '';
@@ -456,8 +459,8 @@ export function PreviewModal({
   const activeDeck = activeView?.deck ?? false;
   const isCustomView = activeCustom !== null && activeCustom !== undefined;
   const srcDoc = useMemo(
-    () => (activeHtml ? buildSrcdoc(activeHtml, { deck: activeDeck }) : ''),
-    [activeHtml, activeDeck],
+    () => (activeHtml ? buildSrcdoc(activeHtml, { deck: activeDeck, hosted }) : ''),
+    [activeHtml, activeDeck, hosted],
   );
   const exportTitle = exportTitleFor(activeView?.id ?? '');
   const canExportFiles = Boolean(activeHtml);
@@ -1074,7 +1077,7 @@ export function PreviewModal({
                   key={activeView?.id ?? 'view'}
                   ref={previewIframeRef}
                   title={`${title} ${activeView?.label ?? ''}`}
-                  sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+                  sandbox={hosted ? HOSTED_PREVIEW_SANDBOX : 'allow-scripts allow-popups allow-popups-to-escape-sandbox'}
                   srcDoc={srcDoc}
                 />
               </div>

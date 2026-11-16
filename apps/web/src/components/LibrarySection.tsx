@@ -28,6 +28,7 @@ import {
   fetchLibraryAssets,
   fetchLibraryAssetAsFile,
   libraryAssetRawUrl,
+  libraryAssetPreviewUrl,
   syncLibrary,
   type LibraryAssetQuery,
 } from '../providers/registry';
@@ -162,7 +163,7 @@ function MediaThumb({ asset }: { asset: LibraryAsset }) {
     media = (
       <iframe
         className={styles.thumbFrame}
-        src={rawUrl}
+        src={libraryAssetPreviewUrl(asset.id)}
         sandbox=""
         scrolling="no"
         loading="lazy"

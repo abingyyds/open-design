@@ -1,7 +1,9 @@
 import type { Express } from 'express';
 import type { RouteDeps } from '../server-context.js';
 
-export interface RegisterDeployRoutesDeps extends RouteDeps<'db' | 'http' | 'paths' | 'ids' | 'deploy' | 'projectStore'> {}
+export interface RegisterDeployRoutesDeps extends RouteDeps<'db' | 'http' | 'paths' | 'ids' | 'deploy' | 'projectStore'> {
+  platform?: { enabled: boolean };
+}
 
 export function registerDeployRoutes(app: Express, ctx: RegisterDeployRoutesDeps) {
   const { db } = ctx;
@@ -10,6 +12,11 @@ export function registerDeployRoutes(app: Express, ctx: RegisterDeployRoutesDeps
   const { randomUUID } = ctx.ids;
   const { getProject } = ctx.projectStore;
   const { VERCEL_PROVIDER_ID, CLOUDFLARE_PAGES_PROVIDER_ID, isDeployProviderId, publicDeployConfigForProvider, readDeployConfig, writeDeployConfig, listCloudflarePagesZones, DeployError, listDeployments, publicDeployments, getDeployment, buildDeployFileSet, cloudflarePagesProjectNameForDeploy, deployToCloudflarePages, deployToVercel, upsertDeployment, publicDeployment, cloudflarePagesDeploymentMetadata, prepareDeployPreflight } = ctx.deploy;
+  if (ctx.platform?.enabled) {
+    app.use(['/api/deploy', '/api/projects/:id/deploy'], (_req, res) =>
+      sendApiError(res, 403, 'FORBIDDEN', 'Shared deployment credentials are unavailable in hosted mode'),
+    );
+  }
   // ---- Deploy --------------------------------------------------------------
 
   app.get('/api/deploy/config', async (req, res) => {
@@ -194,7 +201,9 @@ export function registerDeployRoutes(app: Express, ctx: RegisterDeployRoutesDeps
 
 }
 
-export interface RegisterDeploymentCheckRoutesDeps extends RouteDeps<'db' | 'http' | 'deploy'> {}
+export interface RegisterDeploymentCheckRoutesDeps extends RouteDeps<'db' | 'http' | 'deploy'> {
+  platform?: { enabled: boolean };
+}
 
 export function registerDeploymentCheckRoutes(app: Express, ctx: RegisterDeploymentCheckRoutesDeps) {
   const { db } = ctx;
@@ -223,7 +232,9 @@ export function registerDeploymentCheckRoutes(app: Express, ctx: RegisterDeploym
             ? cloudflarePagesProjectNameFromDeployment(existing)
             : '';
         if (existing.providerId === CLOUDFLARE_PAGES_PROVIDER_ID && existing.cloudflarePages?.pagesDev?.url) {
-          const checked = await checkCloudflarePagesDeploymentLinks(existing);
+          const checked = await checkCloudflarePagesDeploymentLinks(existing, {
+            useSharedCredentials: !ctx.platform?.enabled,
+          });
           const now = Date.now();
           /** @type {import('@open-design/contracts').CheckDeploymentLinkResponse} */
           const body = upsertDeployment(db, {

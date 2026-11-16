@@ -10,7 +10,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
-import { executionProfileFromStreamFormat, PLUGIN_SHARE_ACTION_PLUGIN_IDS } from '@open-design/contracts';
+import { executionProfileFromStreamFormat, hasFreshCloudflarePagesBinding, PLUGIN_SHARE_ACTION_PLUGIN_IDS } from '@open-design/contracts';
 import {
   composeSystemPrompt,
   resolveExclusiveSurface,
@@ -459,6 +459,7 @@ import {
   getMessageTelemetryFinalizationState,
   getProject,
   getTemplate,
+  hostedTemplateBelongsToProject,
   insertConversation,
   insertProject,
   insertRoutine,
@@ -601,7 +602,9 @@ import {
   platformSessionMiddleware,
   registerSubrouterPlatformRoutes,
 } from './platform/subrouter.js';
-import { hostedMaintenanceRequired } from './platform/deployment.js';
+import { setHostedDownloadHeaders } from './http/hosted-file-response.js';
+import { hostedMaintenanceRequired, hostedPlatformEnabled } from './platform/deployment.js';
+import { createHostedPreviewRoutes } from './http/hosted-preview.js';
 import { startHostedMaintenanceServer } from './platform/hosted-maintenance.js';
 import { createOpenDesignPublicMetadataService } from './services/open-design-public-metadata.js';
 
@@ -2467,6 +2470,24 @@ function cloudflarePagesProjectNameForDeploy(db, projectId, projectName, prior) 
 function publicDeployment(deployment) {
   if (!deployment || typeof deployment !== 'object') return deployment;
   const { providerMetadata: _providerMetadata, ...publicShape } = deployment;
+  const pages = publicShape.cloudflarePages;
+  if (hostedPlatformEnabled() && pages?.pagesDev) {
+    publicShape.url = pages.pagesDev.url || publicShape.url;
+    if (pages.customDomain?.status !== 'ready' || hasFreshCloudflarePagesBinding(pages.customDomain)) {
+      return publicShape;
+    }
+    // Older refreshes could have persisted ready from reachability alone.
+    const customDomain = {
+      ...pages.customDomain,
+      status: 'pending',
+      statusMessage: 'Cloudflare Pages has not confirmed this custom-domain binding.',
+    };
+    return {
+      ...publicShape,
+      ...aggregateCloudflarePagesStatus(pages.pagesDev, customDomain),
+      cloudflarePages: { ...pages, customDomain },
+    };
+  }
   return publicShape;
 }
 
@@ -2474,10 +2495,10 @@ function publicDeployments(deployments) {
   return (deployments || []).map(publicDeployment);
 }
 
-async function checkCloudflarePagesDeploymentLinks(existing) {
+async function checkCloudflarePagesDeploymentLinks(existing, { useSharedCredentials = true } = {}) {
   const current = existing.cloudflarePages || {};
   const projectName = current.projectName || cloudflarePagesProjectNameFromDeployment(existing);
-  const config = await readDeployConfig(CLOUDFLARE_PAGES_PROVIDER_ID);
+  const config = useSharedCredentials ? await readDeployConfig(CLOUDFLARE_PAGES_PROVIDER_ID) : null;
   const pagesDevUrl = current.pagesDev?.url || existing.url;
   const pagesDevResult = await checkDeploymentUrl(pagesDevUrl);
   const pagesDev = {
@@ -2491,22 +2512,27 @@ async function checkCloudflarePagesDeploymentLinks(existing) {
   };
   let customDomain = current.customDomain;
   if (customDomain?.url && customDomain.status !== 'conflict') {
-    let pagesDomain = null;
+    let pagesDomain: Awaited<ReturnType<typeof readCloudflarePagesDomain>> | undefined;
     if (config?.token && config?.accountId && projectName) {
       try {
         pagesDomain = await readCloudflarePagesDomain({ ...config, projectName }, customDomain.hostname);
       } catch {
-        pagesDomain = null;
+        // Transport failures can retain recent evidence, but cannot renew it.
       }
     }
     const customResult = await checkDeploymentUrl(customDomain.url);
-    const pagesDomainStatus = pagesDomain?.status || customDomain.pagesDomainStatus;
+    const bindingMissing = pagesDomain === null;
+    const pagesDomainStatus = pagesDomain === undefined ? customDomain.pagesDomainStatus : pagesDomain?.status;
+    const checkedAt = Date.now();
+    const bindingVerifiedAt = pagesDomain === undefined
+      ? customDomain.bindingVerifiedAt
+      : String(pagesDomainStatus || '').toLowerCase() === 'active' ? checkedAt : undefined;
     const failedByApi = ['error', 'blocked', 'deactivated'].includes(String(pagesDomainStatus || '').toLowerCase());
-    const activeByApi = String(pagesDomainStatus || '').toLowerCase() === 'active';
-    const readyByReachability = customResult.reachable && activeByApi;
+    const bindingVerified = hasFreshCloudflarePagesBinding({ pagesDomainStatus, bindingVerifiedAt }, checkedAt);
+    const readyByReachability = customResult.reachable && bindingVerified;
     customDomain = {
       ...customDomain,
-      domainStatus: pagesDomain
+      domainStatus: bindingMissing ? 'failed' : pagesDomain
         ? pagesDomain.status === 'active'
           ? 'active'
           : failedByApi
@@ -2514,18 +2540,27 @@ async function checkCloudflarePagesDeploymentLinks(existing) {
             : 'pending'
         : customDomain.domainStatus,
       pagesDomainStatus,
+      bindingVerifiedAt,
+      errorMessage: bindingMissing ? 'Cloudflare Pages no longer lists this custom domain.'
+        : bindingVerified ? undefined : customDomain.errorMessage,
       validationData: pagesDomain?.validation_data ?? customDomain.validationData,
       verificationData: pagesDomain?.verification_data ?? customDomain.verificationData,
       status: readyByReachability
         ? 'ready'
-        : customDomain.status === 'failed' || failedByApi
+        : customDomain.status === 'failed' || failedByApi || bindingMissing
           ? 'failed'
           : 'pending',
       statusMessage: readyByReachability
-        ? 'Custom domain is ready.'
+        ? (useSharedCredentials ? 'Custom domain is ready.' : 'Custom domain is publicly reachable.')
+        : bindingMissing
+          ? 'Cloudflare Pages no longer lists this custom domain.'
         : failedByApi
           ? 'Cloudflare Pages reported a custom-domain error.'
-        : customResult.statusMessage || customDomain.statusMessage || 'Custom domain is still being prepared.',
+          : !useSharedCredentials && customResult.reachable && !bindingVerified
+            ? 'Custom domain responds, but Cloudflare Pages has not confirmed its binding.'
+          : customResult.statusMessage || (useSharedCredentials
+            ? customDomain.statusMessage || 'Custom domain is still being prepared.'
+            : 'Public custom-domain check did not succeed.'),
     };
   }
   const cloudflarePages = {
@@ -2538,7 +2573,9 @@ async function checkCloudflarePagesDeploymentLinks(existing) {
   return {
     url: pagesDev.url,
     status: aggregate.status,
-    statusMessage: aggregate.statusMessage,
+    statusMessage: !useSharedCredentials && pagesDev.status === 'ready' && customDomain?.status === 'ready'
+      ? 'Both public links are reachable.'
+      : aggregate.statusMessage,
     cloudflarePages,
     providerMetadata: {
       ...(existing.providerMetadata || {}),
@@ -3398,6 +3435,16 @@ export async function startServer({
   app.use('/api/brands/:id/extract-from-html', express.json({ limit: '32mb' }));
   app.use(express.json({ limit: '4mb' }));
   const projectPreviewScopes = createProjectPreviewScopeRegistry();
+  const hostedPreview = subrouterPlatform.enabled
+    ? createHostedPreviewRoutes({
+      currentSession(req) {
+        if (req.headers.cookie && !subrouterPlatform.currentUser(req)) subrouterPlatform.attachSession(req);
+        return subrouterPlatform.previewSession(req);
+      },
+      isActive: (sessionId, ownerId) => subrouterPlatform.isPreviewSessionActive(sessionId, ownerId),
+    })
+    : undefined;
+  hostedPreview?.registerAssets(app);
 
   // Plan §3.K1 — bearer-token middleware.
   //
@@ -3553,6 +3600,7 @@ export async function startServer({
   });
   registerSubrouterPlatformRoutes(app, subrouterPlatform);
   app.use('/api', platformSessionMiddleware(subrouterPlatform));
+  hostedPreview?.registerDocuments(app);
   const db = openDatabase(PROJECT_ROOT, { dataDir: RUNTIME_DATA_DIR });
   // Restore paired browser-extension origins into the in-memory allowlist the
   // /api origin middleware above consults, so a paired clipper survives daemon
@@ -3730,20 +3778,16 @@ export async function startServer({
   // Warm agent-capability probes (e.g. whether the installed Claude Code
   // build advertises --include-partial-messages) so the first /api/chat
   // hits a populated cache even if /api/agents hasn't been called yet.
-  void readAppConfig(RUNTIME_DATA_DIR)
-    .then((config) => {
-      // Orbit owns a daemon-global connector context and its scheduled runner
-      // has no browser session to select a SubRouter tenant. Do not let a
-      // hosted platform process silently run one user's (or the local
-      // operator's) model/connector configuration in the background.
-      orbitService.configure(
-        subrouterPlatform.enabled
-          ? { ...(config.orbit ?? {}), enabled: false }
-          : config.orbit,
-      );
-      return detectAgents(config.agentCliEnv ?? {});
-    })
-    .catch(() => detectAgents().catch(() => {}));
+  if (subrouterPlatform.enabled) {
+    orbitService.configure({ enabled: false });
+  } else {
+    void readAppConfig(RUNTIME_DATA_DIR)
+      .then((config) => {
+        orbitService.configure(config.orbit);
+        return detectAgents(config.agentCliEnv ?? {});
+      })
+      .catch(() => detectAgents().catch(() => {}));
+  }
 
   await recoverStaleLiveArtifactRefreshes({ projectsRoot: PROJECTS_DIR }).catch((error) => {
     console.warn('[od] Failed to recover stale live artifact refreshes:', error);
@@ -3757,7 +3801,8 @@ export async function startServer({
 
 
   registerMemoryRoutes(app, {
-    http: { createSseResponse, requireLocalDaemonRequest },
+    platform: subrouterPlatform,
+    http: { createSseResponse, requireLocalDaemonRequest, sendApiError },
     paths: { RUNTIME_DATA_DIR, PROJECT_ROOT, PROJECTS_DIR },
     appConfig: { readAppConfig },
   });
@@ -4140,27 +4185,32 @@ export async function startServer({
 
   // External services
   registerMcpRoutes(app, {
+    platform: subrouterPlatform,
     http: httpDeps,
     paths: pathDeps,
     mcp: { pendingAuth: mcpPendingAuth, daemonUrlRef },
   });
   registerXaiRoutes(app, {
+    platform: subrouterPlatform,
     http: httpDeps,
     paths: pathDeps,
   });
   // Project workspace
   registerActiveContextRoutes(app, {
+    platform: subrouterPlatform,
     db,
     http: httpDeps,
     projectStore: projectStoreDeps,
   });
-  registerHostToolsRoutes(app, {
-    db,
-    http: httpDeps,
-    paths: pathDeps,
-    projectStore: projectStoreDeps,
-    projectFiles: projectFileDeps,
-  });
+  if (!subrouterPlatform.enabled) {
+    registerHostToolsRoutes(app, {
+      db,
+      http: httpDeps,
+      paths: pathDeps,
+      projectStore: projectStoreDeps,
+      projectFiles: projectFileDeps,
+    });
+  }
   // OD Library — global asset registry (clipper ingest, grid, pairing, apply).
   registerLibraryRoutes(app, {
     db,
@@ -4170,6 +4220,25 @@ export async function startServer({
     projectFiles: projectFileDeps,
     conversations: conversationDeps,
     auth: authDeps,
+    platform: subrouterPlatform,
+  });
+  registerSocialShareRoutes(app, { http: httpDeps });
+  registerProjectRoutes(app, {
+    db,
+    design,
+    http: httpDeps,
+    paths: pathDeps,
+    projectStore: projectStoreDeps,
+    projectFiles: projectFileDeps,
+    conversations: conversationDeps,
+    templates: templateDeps,
+    status: projectStatusDeps,
+    events: projectEventDeps,
+    ids: idDeps,
+    telemetry: { reportFinalizedMessage },
+    appConfig: appConfigDeps,
+    agents: agentDeps,
+    validation: validationDeps,
     platform: subrouterPlatform,
   });
   app.post('/api/projects/:id/figma/import', (req, res) => {
@@ -4212,33 +4281,16 @@ export async function startServer({
       }
     });
   });
-  registerSocialShareRoutes(app, { http: httpDeps });
-  registerProjectRoutes(app, {
-    db,
-    design,
-    http: httpDeps,
-    paths: pathDeps,
-    projectStore: projectStoreDeps,
-    projectFiles: projectFileDeps,
-    conversations: conversationDeps,
-    templates: templateDeps,
-    status: projectStatusDeps,
-    events: projectEventDeps,
-    ids: idDeps,
-    telemetry: { reportFinalizedMessage },
-    appConfig: appConfigDeps,
-    agents: agentDeps,
-    validation: validationDeps,
-    platform: subrouterPlatform,
-  });
-  registerTerminalRoutes(app, {
-    db,
-    http: httpDeps,
-    paths: pathDeps,
-    projectStore: projectStoreDeps,
-    projectFiles: projectFileDeps,
-    terminals: terminalService,
-  });
+  if (!subrouterPlatform.enabled) {
+    registerTerminalRoutes(app, {
+      db,
+      http: httpDeps,
+      paths: pathDeps,
+      projectStore: projectStoreDeps,
+      projectFiles: projectFileDeps,
+      terminals: terminalService,
+    });
+  }
   registerImportRoutes(app, {
     db,
     http: httpDeps,
@@ -4289,6 +4341,7 @@ export async function startServer({
     projectStore: projectStoreDeps,
     projectFiles: projectFileDeps,
     platform: subrouterPlatform,
+    hostedPreview,
     designSystems: {
       buildUserDesignSystemArchive,
       createUserDesignSystem,
@@ -4321,6 +4374,7 @@ export async function startServer({
     platform: subrouterPlatform,
     randomId,
     resolveTranscriptAgent: async () => {
+      if (subrouterPlatform.enabled) return null;
       const config = await readAppConfig(RUNTIME_DATA_DIR);
       let agentId = typeof config.agentId === 'string' && config.agentId
         ? config.agentId
@@ -4345,8 +4399,10 @@ export async function startServer({
     paths: pathDeps,
     node: nodeDeps,
     artifacts: artifactDeps,
+    platform: subrouterPlatform,
   });
   registerLiveArtifactRoutes(app, {
+    platform: subrouterPlatform,
     db,
     http: httpDeps,
     paths: pathDeps,
@@ -4360,12 +4416,18 @@ export async function startServer({
     paths: pathDeps,
     projects: { getProject: (id: string) => getProject(db, id) },
   });
-  app.use('/artifacts', express.static(ARTIFACTS_DIR));
   app.use(
     PLUGIN_PREVIEWS_ROUTE,
-    express.static(PLUGIN_PREVIEWS_DIR, { maxAge: '1d', immutable: false }),
+    express.static(PLUGIN_PREVIEWS_DIR, {
+      maxAge: '1d',
+      immutable: false,
+      ...(subrouterPlatform.enabled ? {
+        setHeaders: (res, file) => setHostedDownloadHeaders(res, mimeFor(file)),
+      } : {}),
+    }),
   );
   registerDeployRoutes(app, {
+    platform: subrouterPlatform,
     db,
     http: httpDeps,
     paths: pathDeps,
@@ -4390,7 +4452,7 @@ export async function startServer({
     validation: validationDeps,
     handoff: handoffDeps,
   });
-  registerDeploymentCheckRoutes(app, { db, http: httpDeps, deploy: deployDeps });
+  registerDeploymentCheckRoutes(app, { db, http: httpDeps, deploy: deployDeps, platform: subrouterPlatform });
   app.use('/frames', express.static(FRAMES_DIR));
   registerProjectExportRoutes(app, {
     db,
@@ -4412,6 +4474,8 @@ export async function startServer({
     documents: { buildDocumentPreview },
     artifacts: artifactDeps,
     projectPreviewScopes,
+    platform: subrouterPlatform,
+    hostedPreview,
   });
 
   registerMediaRoutes(app, {
@@ -4653,6 +4717,7 @@ export async function startServer({
   }
 
   registerPluginRoutes(app, {
+    platform: subrouterPlatform,
     db,
     paths: { PROJECTS_DIR, PLUGIN_REGISTRY_ROOTS, PLUGIN_LOCKFILE_PATH },
     plugins: {
@@ -4687,6 +4752,7 @@ export async function startServer({
     marketplaceRegistryIdFromUrl,
   });
   registerPluginAssetRoutes(app, {
+    platform: subrouterPlatform,
     db,
     pluginAssetCache,
     AssetCacheError,
@@ -4702,6 +4768,7 @@ export async function startServer({
   });
 
   registerProjectPluginRoutes(app, {
+    platform: subrouterPlatform,
     db,
     paths: { PROJECTS_DIR, PLUGIN_REGISTRY_ROOTS, PLUGIN_LOCKFILE_PATH },
     plugins: {
@@ -5077,10 +5144,20 @@ export async function startServer({
       }
     }
 
-    const template =
+    const requestedTemplate =
       metadata?.kind === 'template' && typeof metadata.templateId === 'string'
-        ? (getTemplate(db, metadata.templateId) ?? undefined)
-        : undefined;
+        ? getTemplate(db, metadata.templateId)
+        : null;
+    const templateSourceProject = subrouterPlatform.enabled && typeof requestedTemplate?.sourceProjectId === 'string'
+      ? getProject(db, requestedTemplate.sourceProjectId)
+      : null;
+    const template = requestedTemplate && (!subrouterPlatform.enabled || (
+      typeof metadata?.platformUserId === 'string'
+      && subrouterPlatform.projectBelongsToUser(templateSourceProject, {
+        id: metadata.platformUserId,
+      })
+      && hostedTemplateBelongsToProject(db, requestedTemplate.id, templateSourceProject)
+    )) ? requestedTemplate : undefined;
     let audioVoiceOptions = [];
     let audioVoiceOptionsError;
     if (
@@ -5370,6 +5447,11 @@ export async function startServer({
   };
 
   const startChatRun = async (chatBody, run) => {
+    // Hosted runs require the separate worker and credential transport. The
+    // local daemon pipeline may spawn plugins, commands and other host tools.
+    if (subrouterPlatform.enabled) {
+      return design.runs.fail(run, 'AGENT_EXECUTION_FAILED', 'Hosted tasks are in security maintenance.');
+    }
     run.analyticsTelemetry = {
       ...(run.analyticsTelemetry ?? {}),
       startChatRunStartedAt: Date.now(),
@@ -5859,22 +5941,6 @@ export async function startServer({
     } catch {
       configuredAgentEnv = {};
     }
-    let platformRuntime = null;
-    if (subrouterPlatform.enabled && typeof chatBody.platformUserId === 'string') {
-      try {
-        platformRuntime = subrouterPlatform.runtimeForUser(chatBody.platformUserId);
-        configuredAgentEnv = {
-          ...configuredAgentEnv,
-          ...platformRuntime.agentEnv,
-        };
-      } catch (err) {
-        return design.runs.fail(
-          run,
-          typeof err?.code === 'string' ? err.code : 'PLATFORM_LOGIN_REQUIRED',
-          err && err.message ? err.message : '请先登录平台账号',
-        );
-      }
-    }
     const requestedLiveModelScope = def.id === 'amr'
       ? resolveAmrProfile({
           ...process.env,
@@ -5892,10 +5958,6 @@ export async function startServer({
       process.env,
       requestedLiveModelScope,
     );
-    if (platformRuntime?.model && def.id === 'codex') {
-      safeModel = platformRuntime.model;
-      run.model = platformRuntime.model;
-    }
     const safeReasoning =
       typeof reasoning === 'string' && Array.isArray(def.reasoningOptions)
         ? (def.reasoningOptions.find((r) => r.id === reasoning)?.id ?? null)
@@ -8730,6 +8792,7 @@ export async function startServer({
     systemPrompt,
     template,
   }) => {
+    if (subrouterPlatform.enabled) throw new Error('Orbit is unavailable in hosted mode');
     // Each Orbit run gets its own project so the conversation, messages, and
     // live artifact are isolated. The handler does the synchronous prep here
     // (insert project/conversation/run rows, kick off the chat run) and
@@ -8910,6 +8973,7 @@ export async function startServer({
   // Each routine fire resolves an agent, prepares project/conversation state,
   // and dispatches into the same chat runner used by manual runs.
   routineService.setRunHandler(async ({ routine, trigger, startedAt, runId }) => {
+    if (subrouterPlatform.enabled) throw new Error('Routines are unavailable in hosted mode');
     const appConfig = await readAppConfig(RUNTIME_DATA_DIR);
     let agentId = routine.agentId
       || (typeof appConfig.agentId === 'string' && appConfig.agentId ? appConfig.agentId : null);
@@ -9327,6 +9391,7 @@ export async function startServer({
 
 
   registerChatRoutes(app, {
+    platform: subrouterPlatform,
     db,
     design,
     http: httpDeps,

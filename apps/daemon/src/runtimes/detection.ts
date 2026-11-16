@@ -11,6 +11,7 @@ import { probeAgentAuthStatus } from './auth.js';
 import { agentCapabilities } from './capabilities.js';
 import { installMetaForAgent } from './metadata.js';
 import { resolveAmrProfile } from '../integrations/vela.js';
+import { hostedPlatformEnabled } from '../platform/deployment.js';
 import {
   buildAuthDiagnostic,
   buildExecutableDiagnostic,
@@ -323,6 +324,7 @@ function rememberDetectedLiveModels(
 export async function detectAgents(
   configuredEnvByAgent: Record<string, Record<string, string>> = {},
 ) {
+  if (hostedPlatformEnabled()) return [];
   const results = await Promise.all(
     AGENT_DEFS.map((def) => safeProbe(def, configuredEnvByAgent?.[def.id] ?? {})),
   );
@@ -346,6 +348,7 @@ export async function detectAgents(
 export async function* detectAgentsStream(
   configuredEnvByAgent: Record<string, Record<string, string>> = {},
 ): AsyncGenerator<DetectedAgent> {
+  if (hostedPlatformEnabled()) return;
   const tagged = AGENT_DEFS.map((def, index) =>
     safeProbe(def, configuredEnvByAgent?.[def.id] ?? {}).then((agent) => {
       rememberDetectedLiveModels(def, configuredEnvByAgent?.[def.id] ?? {}, agent);

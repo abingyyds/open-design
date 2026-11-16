@@ -1,8 +1,11 @@
-import { rm } from 'node:fs/promises';
+import { lstat, mkdir, rm, rmdir } from 'node:fs/promises';
+import { hostedTemplateBelongsToProject, isHostedProjectIdRetired } from '../../db.js';
 import path from 'node:path';
-import type { Express, Request, Response } from 'express';
+import express, { type Express, type Request, type Response } from 'express';
 import {
   defaultScenarioPluginIdForProjectMetadata,
+  HOSTED_PREVIEW_DOCUMENT_POLICY,
+  HOSTED_PREVIEW_SANDBOX,
   type ChatSessionMode,
   type PluginManifest,
 } from '@open-design/contracts';
@@ -19,9 +22,12 @@ import {
   resolvePluginSnapshot,
 } from '../../plugins/index.js';
 import { connectorService } from '../../connectors/service.js';
+import { setHostedDownloadHeaders } from '../../http/hosted-file-response.js';
+import { MAX_INLINE_OWNER_BYTES } from '../../inline-assets.js';
+import { HostedPreviewBusy, HostedPreviewReadLimit, type HostedPreviewRoutes } from '../../http/hosted-preview.js';
 import type { RouteDeps } from '../../server-context.js';
 import { listSkills } from '../../skills.js';
-import { isSafeId } from '../../projects.js';
+import { hasExternalProjectRoot, isSafeId } from '../../projects.js';
 import {
   BUILT_IN_PROJECT_LOCATION_ID,
   allProjectLocations,
@@ -973,6 +979,7 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
   }
 
   async function configuredProjectLocations() {
+    if (platform?.enabled) return allProjectLocations(PROJECTS_DIR, undefined);
     const config = await readAppConfig(ctx.paths.RUNTIME_DATA_DIR);
     const all = allProjectLocations(PROJECTS_DIR, config.projectLocations);
     const valid = all[0] ? [all[0]] : [];
@@ -1042,13 +1049,15 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
     const sourceProject = typeof template?.sourceProjectId === 'string'
       ? getProject(db, template.sourceProjectId)
       : null;
-    return platformProjectVisible(req, sourceProject);
+    return platformProjectVisible(req, sourceProject)
+      && hostedTemplateBelongsToProject(db, template.id, sourceProject);
   }
 
   async function resolveCreateProjectLocationId(explicitProjectLocationId: unknown): Promise<string> {
     if (typeof explicitProjectLocationId === 'string' && explicitProjectLocationId.trim()) {
       return explicitProjectLocationId.trim();
     }
+    if (platform?.enabled) return BUILT_IN_PROJECT_LOCATION_ID;
     const config = await readAppConfig(ctx.paths.RUNTIME_DATA_DIR);
     const configuredDefault = typeof config.defaultProjectLocationId === 'string'
       ? config.defaultProjectLocationId.trim()
@@ -1080,8 +1089,12 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
   app.use('/api/projects/:id', (req, res, next) => {
     if (!platform?.enabled) return next();
     const project = getProject(db, req.params.id);
-    if (project && !platformProjectVisible(req, project)) {
+    if (!project || !platformProjectVisible(req, project)) {
       return sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'not found');
+    }
+    const removingProject = req.method === 'DELETE' && req.path === '/';
+    if (hasExternalProjectRoot(project?.metadata) && !removingProject) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Hosted projects cannot access server directories.');
     }
     return next();
   });
@@ -1098,6 +1111,9 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
   });
 
   app.put('/api/project-locations', async (req, res) => {
+    if (platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Hosted projects must use managed storage.');
+    }
     try {
       const requested = Array.isArray(req.body?.locations) ? req.body.locations : null;
       if (!requested) return sendApiError(res, 400, 'BAD_REQUEST', 'locations must be an array');
@@ -1129,6 +1145,9 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
   });
 
   app.post('/api/project-locations/scan', async (_req, res) => {
+    if (platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Hosted projects must use managed storage.');
+    }
     try {
       const locations = (await configuredProjectLocations()).filter((loc: any) => !loc.builtIn);
       const imported = [];
@@ -1347,9 +1366,19 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
         return sendApiError(res, 400, skillValidation.code, skillValidation.message);
       }
       const normalizedSkillId = skillValidation.id;
+      const templateId = metadata?.kind === 'template' && typeof metadata.templateId === 'string'
+        ? metadata.templateId
+        : null;
+      const template = templateId === null ? null : getTemplate(db, templateId);
+      if (platform?.enabled && templateId !== null && (!template || !templateVisibleForRequest(req, template))) {
+        return sendApiError(res, 404, 'NOT_FOUND', 'template not found');
+      }
       const selectedLocationId = await resolveCreateProjectLocationId(projectLocationId);
       let externalProjectDir: string | null = null;
       if (selectedLocationId !== BUILT_IN_PROJECT_LOCATION_ID) {
+        if (platform?.enabled) {
+          return sendApiError(res, 403, 'FORBIDDEN', 'Hosted projects must use managed storage.');
+        }
         const location = (await configuredProjectLocations()).find((loc: any) => loc.id === selectedLocationId);
         if (!location || location.builtIn) {
           return sendApiError(res, 400, 'BAD_REQUEST', 'unknown project location');
@@ -1398,6 +1427,24 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
                 }
               : null;
       const projectMetadata = platformStampProjectMetadata(req, rawProjectMetadata);
+      let reservedHostDirectory: string | undefined;
+      if (platform?.enabled) {
+        if (getProject(db, id) || isHostedProjectIdRetired(db, id)) {
+          return sendApiError(res, 409, 'CONFLICT', 'Project ID is unavailable');
+        }
+        const managedDirectory = path.join(PROJECTS_DIR, id);
+        try {
+          // Exclusive creation prevents a new project from inheriting any
+          // files from an older project or an interrupted cleanup.
+          await mkdir(managedDirectory, { mode: 0o700 });
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+            return sendApiError(res, 409, 'CONFLICT', 'Project ID is unavailable');
+          }
+          throw err;
+        }
+        reservedHostDirectory = managedDirectory;
+      }
       const now = Date.now();
       let project;
       try {
@@ -1430,6 +1477,7 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
         if (externalProjectDir) {
           await rm(externalProjectDir, { recursive: true, force: true }).catch(() => {});
         }
+        if (reservedHostDirectory) await rmdir(reservedHostDirectory).catch(() => {});
         throw err;
       }
       // Seed a default conversation so the UI always has somewhere to write.
@@ -1489,36 +1537,28 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
       // HTML into the new project folder so the agent can Read/edit files
       // on disk (the system prompt also embeds them, but a real on-disk
       // copy lets the agent treat them as the project's working state).
-      if (
-        metadata &&
-        typeof metadata === 'object' &&
-        metadata.kind === 'template' &&
-        typeof metadata.templateId === 'string'
-      ) {
-        const tpl = getTemplate(db, metadata.templateId);
-        if (tpl && Array.isArray(tpl.files) && tpl.files.length > 0) {
-          await ensureProject(PROJECTS_DIR, id, projectMetadata);
-          for (const f of tpl.files) {
-            if (
-              !f ||
-              typeof f.name !== 'string' ||
-              typeof f.content !== 'string'
-            ) {
-              continue;
-            }
-            try {
-              await writeProjectFile(
-                PROJECTS_DIR,
-                id,
-                f.name,
-                Buffer.from(f.content, 'utf8'),
-                {},
-                projectMetadata,
-              );
-            } catch {
-              // Skip individual file failures — the template snapshot is
-              // best-effort; the agent still has the embedded copy.
-            }
+      if (template && Array.isArray(template.files) && template.files.length > 0) {
+        await ensureProject(PROJECTS_DIR, id, projectMetadata);
+        for (const f of template.files) {
+          if (
+            !f ||
+            typeof f.name !== 'string' ||
+            typeof f.content !== 'string'
+          ) {
+            continue;
+          }
+          try {
+            await writeProjectFile(
+              PROJECTS_DIR,
+              id,
+              f.name,
+              Buffer.from(f.content, 'utf8'),
+              {},
+              projectMetadata,
+            );
+          } catch {
+            // Skip individual file failures — the template snapshot is
+            // best-effort; the agent still has the embedded copy.
           }
         }
       }
@@ -1717,8 +1757,15 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
 
   app.delete('/api/projects/:id', async (req, res) => {
     try {
-      dbDeleteProject(db, req.params.id);
-      await removeProjectDir(PROJECTS_DIR, req.params.id).catch(() => {});
+      const { id } = req.params;
+      const project = platform?.enabled ? getProject(db, id) : null;
+      if (platform?.enabled && !project) {
+        return sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'not found');
+      }
+      dbDeleteProject(db, id);
+      if (!hasExternalProjectRoot(project?.metadata)) {
+        await removeProjectDir(PROJECTS_DIR, id).catch(() => {});
+      }
       /** @type {import('@open-design/contracts').OkResponse} */
       const body = { ok: true };
       res.json(body);
@@ -1865,7 +1912,18 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
       }
       const trimmedName = name.trim();
       const descValue = typeof description === 'string' ? description : null;
-      const existing = findTemplateByNameAndProject(db, trimmedName, sourceProjectId);
+      let origin;
+      if (platform?.enabled) {
+        const currentSource = getProject(db, sourceProjectId);
+        const ownerId = sourceProject.metadata?.platformUserId;
+        if (!currentSource || !platformProjectVisible(req, currentSource)
+          || currentSource.createdAt !== sourceProject.createdAt
+          || typeof ownerId !== 'string' || currentSource.metadata?.platformUserId !== ownerId) {
+          return res.status(404).json({ error: 'source project not found' });
+        }
+        origin = { ownerId, projectCreatedAt: currentSource.createdAt };
+      }
+      const existing = findTemplateByNameAndProject(db, trimmedName, sourceProjectId, origin);
       let t;
       if (existing) {
         t = updateTemplate(db, existing.id, {
@@ -1880,7 +1938,7 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
           sourceProjectId,
           files: snapshot,
           createdAt: Date.now(),
-        });
+        }, origin);
       }
       res.json({ template: t });
     } catch (err: any) {
@@ -1889,19 +1947,31 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
   });
 
   app.delete('/api/templates/:id', (req, res) => {
+    if (platform?.enabled) {
+      const template = getTemplate(db, req.params.id);
+      if (!template || !templateVisibleForRequest(req, template)) {
+        return sendApiError(res, 404, 'NOT_FOUND', 'template not found');
+      }
+    }
     deleteTemplate(db, req.params.id);
     res.json({ ok: true });
   });
 
 }
 
-export interface RegisterProjectArtifactRoutesDeps extends RouteDeps<'http' | 'uploads' | 'paths' | 'node' | 'artifacts'> {}
+export interface RegisterProjectArtifactRoutesDeps extends RouteDeps<'http' | 'uploads' | 'paths' | 'node' | 'artifacts'> {
+  platform?: { enabled: boolean };
+}
 
 export function registerProjectArtifactRoutes(app: Express, ctx: RegisterProjectArtifactRoutesDeps) {
+  const { sendApiError } = ctx.http;
   const { upload } = ctx.uploads;
   const { ARTIFACTS_DIR } = ctx.paths;
   const { path, fs } = ctx.node;
   const { sanitizeSlug, lintArtifact, renderFindingsForAgent } = ctx.artifacts;
+  app.use('/artifacts', ctx.platform?.enabled
+    ? (_req, res) => res.sendStatus(404)
+    : express.static(ARTIFACTS_DIR));
   app.post('/api/upload', upload.array('images', 8), (req, res) => {
     const files = ((req.files || []) as any[]).map((f: any) => ({
       name: f.originalname,
@@ -1917,6 +1987,9 @@ export function registerProjectArtifactRoutes(app: Express, ctx: RegisterProject
   // returned alongside the path so the UI can render a P0/P1 badge and the
   // chat layer can splice them into a system reminder for the agent.
   app.post('/api/artifacts/save', (req, res) => {
+    if (ctx.platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Hosted artifacts must be saved in an owned project');
+    }
     try {
       const { identifier, title, html } = req.body || {};
       if (typeof html !== 'string' || html.length === 0) {
@@ -1960,7 +2033,10 @@ export function registerProjectArtifactRoutes(app: Express, ctx: RegisterProject
 
 }
 
-export interface RegisterProjectFileRoutesDeps extends RouteDeps<'db' | 'http' | 'paths' | 'uploads' | 'node' | 'projectStore' | 'projectFiles' | 'documents' | 'artifacts' | 'projectPreviewScopes'> {}
+export interface RegisterProjectFileRoutesDeps extends RouteDeps<'db' | 'http' | 'paths' | 'uploads' | 'node' | 'projectStore' | 'projectFiles' | 'documents' | 'artifacts' | 'projectPreviewScopes'> {
+  platform?: { enabled: boolean };
+  hostedPreview?: HostedPreviewRoutes;
+}
 
 export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFileRoutesDeps) {
   const { db } = ctx;
@@ -1986,6 +2062,7 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
     "form-action 'none'",
     "base-uri 'none'",
     "object-src 'none'",
+    ...(ctx.platform?.enabled ? ["frame-ancestors 'self'"] : []),
   ].join('; ');
   const previewScopeRe = /^[A-Za-z0-9_-]{8,128}$/u;
 
@@ -2096,7 +2173,8 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
     try {
       const distFile = await readProjectFile(projectsRoot, projectId, distRelPath, metadata);
       return rewriteViteDistAssetUrlsForPreview(distFile.buffer.toString('utf8'));
-    } catch {
+    } catch (error) {
+      if (error instanceof HostedPreviewBusy) throw error;
       return file.buffer;
     }
   }
@@ -2110,6 +2188,49 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
       /\b(href|src)\s*=\s*(["'])\/assets\//gi,
       (_match, attr: string, quote: string) => `${attr}=${quote}dist/assets/`,
     );
+  }
+
+  function addPreviewBridges(req: Request, mime: string, source: Buffer | string): Buffer | string {
+    const scroll = wantsUrlPreviewScrollBridge(req.query.odPreviewBridge);
+    const selection = wantsUrlPreviewSelectionBridge(req.query.odPreviewBridge);
+    const snapshot = wantsUrlPreviewSnapshotBridge(req.query.odPreviewBridge);
+    if ((!scroll && !selection && !snapshot) || !/^text\/html(?:;|$)/i.test(mime)) return source;
+    let html = daemonSanitizeTitleInDoc(source.toString());
+    if (scroll) html = injectUrlPreviewBridge(html, 'scroll');
+    if (selection) html = injectUrlPreviewBridge(html, 'selection');
+    if (snapshot) html = injectUrlPreviewBridge(html, 'snapshot');
+    return html;
+  }
+
+  function hostedProjectPreviewSource(project: NonNullable<ReturnType<typeof getProject>>) {
+    const projectId = project.id;
+    const owner = project.metadata?.platformUserId;
+    return {
+      resolve: async (name: string) => {
+        const current = getProject(db, projectId);
+        if (!current || !owner || current.createdAt !== project.createdAt || current.metadata?.platformUserId !== owner
+          || hasExternalProjectRoot(current.metadata) || !isSafeId(projectId)) return null;
+        if (!(await lstat(path.join(PROJECTS_DIR, projectId))).isDirectory()) return null;
+        return resolveProjectFilePath(PROJECTS_DIR, projectId, name, current.metadata);
+      },
+      render: async (req: Request, bytes: Buffer, name: string) => {
+        const mime = 'text/html';
+        const html = await maybeResolveVitePreviewHtml({
+          file: { mime, buffer: bytes },
+          projectId,
+          relPath: name,
+          metadata: project.metadata,
+          projectsRoot: PROJECTS_DIR,
+          readProjectFile: async (root, id, file, metadata) => {
+            const previewFile = await resolveProjectFilePath(root, id, file, metadata);
+            const buffer = await ctx.hostedPreview?.readSource(req, previewFile, MAX_INLINE_OWNER_BYTES);
+            if (!buffer) throw new Error('Hosted preview session is no longer active');
+            return { buffer };
+          },
+        });
+        return addPreviewBridges(req, mime, html);
+      },
+    };
   }
 
   // Project files. Each project owns a flat folder under .od/projects/<id>/
@@ -2234,6 +2355,21 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
     }
   });
 
+  app.get('/api/projects/:id/preview-source', async (req, res) => {
+    const project = getProject(db, req.params.id);
+    if (!ctx.hostedPreview || !project) return res.sendStatus(404);
+    try {
+      const file = await hostedProjectPreviewSource(project).resolve(previewFilePathForProject(project, req.query.file));
+      if (!file || !/^text\/html(?:;|$)/i.test(file.mime)) return res.sendStatus(404);
+      const bytes = await ctx.hostedPreview.readSource(req, file, MAX_INLINE_OWNER_BYTES);
+      if (!bytes) return res.sendStatus(404);
+      setHostedDownloadHeaders(res, 'text/plain');
+      return res.type('text/plain').send(bytes);
+    } catch (error) {
+      return res.sendStatus(error instanceof HostedPreviewReadLimit ? 413 : error instanceof HostedPreviewBusy ? 429 : 404);
+    }
+  });
+
   app.get('/api/projects/:id/preview-url', async (req, res) => {
     try {
       const project = getProject(db, req.params.id);
@@ -2242,6 +2378,21 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
         return;
       }
       const requestedPath = previewFilePathForProject(project, req.query.file);
+      if (ctx.platform?.enabled) {
+        if (!ctx.hostedPreview) return res.sendStatus(404);
+        const { resolve, render } = hostedProjectPreviewSource(project);
+        const issued = await ctx.hostedPreview.issue(req, requestedPath, resolve, render);
+        if (issued.status !== 200) return res.sendStatus(issued.status);
+        res.setHeader('Cache-Control', 'private, no-store');
+        res.setHeader('Referrer-Policy', 'no-referrer');
+        return res.json({
+          url: issued.url,
+          file: requestedPath,
+          csp: HOSTED_PREVIEW_DOCUMENT_POLICY,
+          iframeSandbox: HOSTED_PREVIEW_SANDBOX,
+          opaqueOrigin: true,
+        } satisfies import('@open-design/contracts').ProjectPreviewUrlResponse);
+      }
       const meta = await resolveProjectFilePath(
         PROJECTS_DIR,
         project.id,
@@ -2271,6 +2422,7 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
   });
 
   app.get(/^\/api\/projects\/([^/]+)\/preview\/([^/]+)\/(.+)$/u, async (req, res) => {
+    if (ctx.platform?.enabled) return res.sendStatus(404);
     try {
       const params = req.params as unknown as { 0?: string; 1?: string; 2?: string };
       const projectId = String(params[0] ?? '');
@@ -2320,10 +2472,11 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
   });
 
 
-  // Preflight for the raw file route. Current artifact fetches are simple GETs
+  // Preflight for project file delivery. Current artifact fetches are simple GETs
   // (no preflight needed), but an explicit handler future-proofs the route if
   // artifacts ever add custom request headers.
-  app.options(/^\/api\/projects\/([^/]+)\/raw\/(.+)$/u, (req, res) => {
+  const projectFileDeliveryPath = /^\/api\/projects\/([^/]+)\/(raw|preview-files)\/(.+)$/u;
+  app.options(projectFileDeliveryPath, (req, res) => {
     if (req.headers.origin === 'null') {
       res.header('Access-Control-Allow-Origin', '*');
       res.header('Access-Control-Allow-Methods', 'GET');
@@ -2332,12 +2485,17 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
     res.sendStatus(204);
   });
 
-  app.get(/^\/api\/projects\/([^/]+)\/raw\/(.+)$/u, async (req, res) => {
+  app.get(projectFileDeliveryPath, async (req, res) => {
     try {
-      const params = req.params as unknown as { 0?: string; 1?: string };
+      const params = req.params as unknown as { 0?: string; 1?: string; 2?: string };
       const projectId = String(params[0] ?? '');
-      const relPath = String(params[1] ?? '');
+      const relPath = String(params[2] ?? '');
       const project = getProject(db, projectId);
+      if (ctx.platform?.enabled && params[1] === 'preview-files') {
+        if (!project || !ctx.hostedPreview) return res.sendStatus(404);
+        const { resolve, render } = hostedProjectPreviewSource(project);
+        return await ctx.hostedPreview.redirect(req, res, relPath, resolve, render);
+      }
       // PreviewModal loads artifact HTML via srcdoc, giving the iframe Origin: "null".
       // data: URIs, file://, and some sandboxed iframes also send null — all are
       // local-only callers, so this is safe. Real cross-origin sites send a real
@@ -2352,9 +2510,9 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
         projectId,
         relPath,
         project?.metadata,
-        undefined,
+        (mime) => { if (ctx.platform?.enabled) setHostedDownloadHeaders(res, mime); },
         async (file) => {
-          let transformed = await maybeResolveVitePreviewHtml({
+          const transformed = await maybeResolveVitePreviewHtml({
             file,
             projectId,
             relPath,
@@ -2362,31 +2520,7 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
             projectsRoot: PROJECTS_DIR,
             readProjectFile,
           });
-          if (
-            (wantsUrlPreviewScrollBridge(req.query.odPreviewBridge) ||
-              wantsUrlPreviewSelectionBridge(req.query.odPreviewBridge) ||
-              wantsUrlPreviewSnapshotBridge(req.query.odPreviewBridge)) &&
-            /^text\/html(?:;|$)/i.test(file.mime)
-          ) {
-            let html = Buffer.isBuffer(transformed) ? transformed.toString('utf8') : transformed;
-            // Sanitize the <title> so Cmd+P → "Save as PDF" produces a
-            // Teams-safe filename. The URL-load iframe uses sandbox without
-            // allow-same-origin, so the host cannot rewrite contentDocument.title
-            // after load — we must do it here in the response. The srcDoc path
-            // has its own sanitization in buildSrcdoc (apps/web/src/runtime/srcdoc.ts).
-            html = daemonSanitizeTitleInDoc(html);
-            if (wantsUrlPreviewScrollBridge(req.query.odPreviewBridge)) {
-              html = injectUrlPreviewBridge(html, 'scroll');
-            }
-            if (wantsUrlPreviewSelectionBridge(req.query.odPreviewBridge)) {
-              html = injectUrlPreviewBridge(html, 'selection');
-            }
-            if (wantsUrlPreviewSnapshotBridge(req.query.odPreviewBridge)) {
-              html = injectUrlPreviewBridge(html, 'snapshot');
-            }
-            transformed = html;
-          }
-          return transformed;
+          return addPreviewBridges(req, file.mime, transformed);
         },
       );
     } catch (err: any) {
@@ -2460,6 +2594,7 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
         fileSplat,
         project?.metadata,
       );
+      if (ctx.platform?.enabled) setHostedDownloadHeaders(res, file.mime);
       res.type(file.mime).send(file.buffer);
     } catch (err: any) {
       const status = err && err.code === 'ENOENT' ? 404 : 400;

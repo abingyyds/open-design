@@ -113,6 +113,9 @@ export function registerImportRoutes(app: Express, ctx: RegisterImportRoutesDeps
   // the same trust-gate, realpath, and data-dir checks as folder import,
   // but updates metadata.baseDir on an existing project record.
   app.post('/api/projects/:id/working-dir', async (req, res) => {
+    if (platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Hosted projects cannot be rebound to server directories.');
+    }
     try {
       const projectId = req.params.id;
       const existing = getProject(db, projectId);
@@ -240,6 +243,9 @@ export function registerImportRoutes(app: Express, ctx: RegisterImportRoutesDeps
   });
 
   app.post('/api/import/folder', async (req, res) => {
+    if (platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Hosted projects cannot import server directories.');
+    }
     try {
       const { baseDir, name, skillId, designSystemId, orchestratorWorkspace } = req.body || {};
       if (typeof baseDir !== 'string' || !baseDir.trim()) {

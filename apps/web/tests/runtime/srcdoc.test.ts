@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { JSDOM } from 'jsdom';
-import { buildSrcdoc } from '../../src/runtime/srcdoc';
+import { buildLazySrcdocTransport, buildSrcdoc } from '../../src/runtime/srcdoc';
 
 const deckHtml = `<!doctype html>
 <html>
@@ -13,6 +13,19 @@ const deckHtml = `<!doctype html>
 </html>`;
 
 describe('buildSrcdoc', () => {
+  it('puts the hosted policy before page content and transport scripts', () => {
+    const source = '<!doctype html><html lang="en"><head><title>Hosted</title></head><body><h1>Fixture</h1></body></html>';
+    const hosted = new JSDOM(buildSrcdoc(source, { hosted: true, deck: true }));
+    const shell = new JSDOM(buildLazySrcdocTransport(true));
+    for (const { window } of [hosted, shell]) {
+      const firstHeadElement = window.document.head.firstElementChild;
+      expect(firstHeadElement?.getAttribute('http-equiv')).toBe('Content-Security-Policy');
+      expect(firstHeadElement?.getAttribute('content')).toContain("connect-src 'none'");
+      expect(firstHeadElement?.getAttribute('content')).toContain("form-action 'none'");
+    }
+    expect(hosted.window.document.querySelector('h1')?.textContent).toBe('Fixture');
+    expect(buildSrcdoc(source)).not.toContain('Content-Security-Policy');
+  });
   it('injects an initial slide index for deck previews', () => {
     const doc = buildSrcdoc(deckHtml, { deck: true, initialSlideIndex: 2 });
 

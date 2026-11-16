@@ -1,0 +1,7 @@
+**
+!dist/
+!dist/platform/
+!dist/platform/hosted-task-wire.js
+!dist/platform/hosted-task-worker.js
+!dist/platform/hosted-task-files.js
+!dist/project-ignored-dirs.js

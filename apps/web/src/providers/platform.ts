@@ -1,3 +1,7 @@
+import { createContext } from 'react';
+
+export const HostedPlatformContext = createContext(false);
+
 export type PlatformAccount = {
   configured: boolean;
   defaultModel: string;

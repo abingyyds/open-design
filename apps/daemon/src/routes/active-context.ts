@@ -1,10 +1,17 @@
-import type { Express } from 'express';
+import type { Express, Request } from 'express';
+import { hasExternalProjectRoot } from '../projects.js';
 import { createApiError } from '@open-design/contracts';
 import { ACTIVE_CONTEXT_TTL_MS } from '../constants.js';
 import type { RouteDeps } from '../server-context.js';
 import { defineJsonRoute, err, mountJsonRoute, ok, type Result } from '../http/index.js';
 
-export interface RegisterActiveContextRoutesDeps extends RouteDeps<'db' | 'http' | 'projectStore'> {}
+export interface RegisterActiveContextRoutesDeps extends RouteDeps<'db' | 'http' | 'projectStore'> {
+  platform?: {
+    enabled: boolean;
+    currentUser(req: Request): { id?: string } | null;
+    projectBelongsToRequest(req: Request, project: unknown): boolean;
+  };
+}
 
 // Soft "what is the user looking at right now in Open Design?" channel. The
 // web UI POSTs the current project + file on every route change; the MCP
@@ -45,6 +52,7 @@ interface ActiveContextDomainDeps {
   db: unknown;
   getProject: (db: unknown, projectId: string) => { name?: string | null } | null | undefined;
   now: () => number;
+  requireOwnedProject?: boolean;
 }
 
 function parsePostActive(raw: { body: unknown }): Result<PostActiveInput> {
@@ -69,6 +77,9 @@ function handlePostActive(
     deps.store.current = null;
     return ok({ active: false });
   }
+  if (deps.requireOwnedProject && !deps.getProject(deps.db, input.projectId)) {
+    return err(createApiError('PROJECT_NOT_FOUND', 'project not found'));
+  }
   const next: ActiveContext = {
     projectId: input.projectId,
     fileName: input.fileName,
@@ -88,6 +99,10 @@ function handleGetActive(
     return ok({ active: false });
   }
   const project = deps.getProject(deps.db, current.projectId);
+  if (deps.requireOwnedProject && !project) {
+    deps.store.current = null;
+    return ok({ active: false });
+  }
   return ok({
     active: true,
     projectId: current.projectId,
@@ -123,6 +138,37 @@ export function registerActiveContextRoutes(app: Express, ctx: RegisterActiveCon
     now: () => Date.now(),
   };
   const adapter = { resolvedPortRef: ctx.http.resolvedPortRef };
-  mountJsonRoute(app, postActiveRoute, domainDeps, adapter);
-  mountJsonRoute(app, getActiveRoute, domainDeps, adapter);
+  const platform = ctx.platform;
+  if (!platform?.enabled) {
+    mountJsonRoute(app, postActiveRoute, domainDeps, adapter);
+    mountJsonRoute(app, getActiveRoute, domainDeps, adapter);
+    return;
+  }
+
+  const tenants = new Map<string, ActiveContextStore>();
+  const requestDeps = (req: Request): ActiveContextDomainDeps => {
+    const userId = platform.currentUser(req)?.id;
+    const now = Date.now();
+    for (const [id, state] of tenants) {
+      if (!state.current || now - state.current.ts > ACTIVE_CONTEXT_TTL_MS) tenants.delete(id);
+    }
+    const tenantStore = (userId && tenants.get(userId)) || { current: null };
+    if (userId) tenants.set(userId, tenantStore);
+    return {
+      ...domainDeps,
+      store: tenantStore,
+      requireOwnedProject: true,
+      getProject: (db, projectId) => {
+        const project = ctx.projectStore.getProject(db, projectId);
+        return userId && project && platform.projectBelongsToRequest(req, project)
+          && !hasExternalProjectRoot(project.metadata) ? project : null;
+      },
+    };
+  };
+  app.use('/api/active', (_req, res, next) => {
+    res.setHeader('Cache-Control', 'private, no-store');
+    next();
+  });
+  mountJsonRoute(app, postActiveRoute, domainDeps, adapter, requestDeps);
+  mountJsonRoute(app, getActiveRoute, domainDeps, adapter, requestDeps);
 }

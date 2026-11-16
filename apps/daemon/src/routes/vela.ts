@@ -27,6 +27,7 @@ import {
   clearVelaWalletSnapshotCache,
   velaWalletSnapshotReader,
 } from '../integrations/vela-wallet.js';
+import { hostedPlatformEnabled } from '../platform/deployment.js';
 import { amrModelLoadingCache } from '../runtimes/amr-model-cache.js';
 import {
   fetchVelaPresetModels,
@@ -134,6 +135,12 @@ function proxyAmrApiRequest(req: Request, res: Response): void {
 
 export function registerVelaRoutes(app: Express, deps: RegisterVelaRoutesDeps): void {
   const env = deps.env ?? process.env;
+  if (hostedPlatformEnabled(env)) {
+    app.use('/api/integrations/vela', (_req, res) => {
+      res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Local Vela integration is unavailable in hosted mode' } });
+    });
+    return;
+  }
   const { RUNTIME_DATA_DIR } = deps.paths;
   const { readAppConfig } = deps.appConfig;
   const getPublicBaseUrl = deps.http.getPublicBaseUrl ?? ((req: Request) => {

@@ -1,5 +1,6 @@
 import fs from 'node:fs';
-import type { Express } from 'express';
+import type { Express, Request } from 'express';
+import { findMediaModel, hostedMediaProviderBlockReason } from '../media/models.js';
 import type { MediaExecutionPolicy } from '@open-design/contracts';
 import { defaultMediaExecutionPolicy, mediaPolicyDenial } from '../media/policy.js';
 import type { RouteDeps } from '../server-context.js';
@@ -22,7 +23,7 @@ const AIHUBMIX_CATALOG_TTL_MS = 5 * 60 * 1000;
 const aihubmixCatalogCache = new Map<string, { at: number; models: Array<{ id: string; label: string }> }>();
 
 export interface RegisterMediaRoutesDeps extends RouteDeps<'db' | 'design' | 'http' | 'paths' | 'ids' | 'auth' | 'media' | 'appConfig' | 'orbit' | 'nativeDialogs' | 'projectStore' | 'projectFiles' | 'conversations' | 'research'> {
-  platform?: { enabled?: boolean };
+  platform?: { enabled?: boolean; projectBelongsToRequest?(req: Request, project: unknown): boolean };
 }
 
 export type LegacyMediaRouteGrantDecision =
@@ -105,7 +106,9 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
   ) => {
     const projectId = options.projectId;
     const project = getProject(db, projectId);
-    if (!project) return res.status(404).json({ error: 'project not found' });
+    if (!project || (platform?.enabled && !platform.projectBelongsToRequest?.(req, project))) {
+      return res.status(404).json({ error: 'project not found' });
+    }
 
     const surface = req.body?.surface;
     if (surface !== 'image' && surface !== 'video' && surface !== 'audio') {
@@ -114,6 +117,10 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
     const model = typeof req.body?.model === 'string' ? req.body.model : '';
     if (!model) {
       return sendApiError(res, 400, 'BAD_REQUEST', 'model is required');
+    }
+    if (platform?.enabled) {
+      const blocked = hostedMediaProviderBlockReason(findMediaModel(model)?.provider);
+      if (blocked) return sendApiError(res, 403, 'FORBIDDEN', blocked);
     }
 
     const policy = mediaPolicyForGrant(options.grant);
@@ -294,6 +301,9 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
   });
 
   app.get('/api/media/config', async (_req, res) => {
+    if (platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Shared daemon configuration is unavailable in hosted mode');
+    }
     try {
       const cfg = await readMaskedConfig(PROJECT_ROOT);
       res.json(cfg);
@@ -305,6 +315,9 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
   });
 
   app.put('/api/media/config', async (req, res) => {
+    if (platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Shared daemon configuration is unavailable in hosted mode');
+    }
     try {
       const cfg = await writeConfig(PROJECT_ROOT, req.body);
       res.json(cfg);
@@ -341,6 +354,9 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
   });
 
   app.get('/api/app-config', async (req, res) => {
+    if (platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Shared daemon configuration is unavailable in hosted mode');
+    }
     if (!isLocalSameOrigin(req, getResolvedPort())) {
       return res.status(403).json({ error: 'cross-origin request rejected' });
     }
@@ -355,16 +371,15 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
   });
 
   app.put('/api/app-config', async (req, res) => {
+    if (platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Shared daemon configuration is unavailable in hosted mode');
+    }
     if (!isLocalSameOrigin(req, getResolvedPort())) {
       return res.status(403).json({ error: 'cross-origin request rejected' });
     }
     try {
       const config = await writeAppConfig(RUNTIME_DATA_DIR, req.body);
-      orbitService.configure(
-        platform?.enabled
-          ? { ...(config.orbit ?? {}), enabled: false }
-          : config.orbit,
-      );
+      orbitService.configure(config.orbit);
       res.json({ config });
     } catch (err: any) {
       res
@@ -397,6 +412,9 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
   // the list here and the pruned list is persisted back, so the picker's
   // "recent folders" never offers a path that no longer resolves.
   app.get('/api/recent-dirs', async (req, res) => {
+    if (platform?.enabled) {
+      return sendApiError(res, 403, 'FORBIDDEN', 'Shared daemon configuration is unavailable in hosted mode');
+    }
     if (!isLocalSameOrigin(req, getResolvedPort())) {
       return res.status(403).json({ error: 'cross-origin request rejected' });
     }
@@ -597,6 +615,10 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
     const taskId = req.params.id;
     const task = getLiveMediaTask(taskId);
     if (!task) return res.status(404).json({ error: 'task not found' });
+    const visible = () => !platform?.enabled
+      || platform.projectBelongsToRequest?.(req, getProject(db, task.projectId)) === true;
+    if (!visible()) return res.status(404).json({ error: 'task not found' });
+    if (platform?.enabled) res.setHeader('Cache-Control', 'private, no-store');
 
     const since = Number.isFinite(req.body?.since) ? Number(req.body.since) : 0;
     const requestedTimeout = Number.isFinite(req.body?.timeoutMs)
@@ -606,6 +628,7 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
 
     const respond = () => {
       if (res.writableEnded) return;
+      if (!visible()) return res.status(404).json({ error: 'task not found' });
       res.json(mediaTaskSnapshot(task, since));
     };
 

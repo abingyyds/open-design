@@ -218,6 +218,14 @@ export const MEDIA_ASPECTS = ['1:1', '16:9', '9:16', '4:3', '3:4'];
 export const VIDEO_LENGTHS_SEC = [3, 5, 8, 10, 15, 30];
 export const AUDIO_DURATIONS_SEC = [5, 10, 15, 30, 60, 120];
 
+export function hostedMediaProviderBlockReason(provider: MediaModel['provider'] | undefined): string | null {
+  switch (provider) {
+    case 'codex': return 'Host Codex image generation is unavailable in hosted mode';
+    case 'hyperframes': return 'Host HyperFrames rendering is unavailable in hosted mode';
+    default: return null;
+  }
+}
+
 export function findMediaModel(id: string): MediaModel | null {
   const all = [
     ...IMAGE_MODELS,

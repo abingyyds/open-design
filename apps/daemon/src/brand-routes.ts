@@ -10,6 +10,8 @@
 //   POST /api/brands/:id/finalize — register the agent's brand kit. JSON.
 
 import fs from 'node:fs';
+import { setHostedDownloadHeaders } from './http/hosted-file-response.js';
+import { mimeFor } from './projects.js';
 import path from 'node:path';
 
 import type { Application, Request, Response } from 'express';
@@ -90,6 +92,20 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
     if (brandVisible(req, String(req.params.id))) return true;
     res.status(404).json({ error: 'brand not found' });
     return false;
+  }
+
+  function resolveBrandProject(req: Request, res: Response, id: string): string | undefined | null {
+    const requested = typeof req.body?.projectId === 'string' && req.body.projectId.trim()
+      ? req.body.projectId
+      : undefined;
+    if (!deps.platform?.enabled) return requested;
+
+    const assigned = readBrandDetail(brandsRoot, id)?.meta.projectId;
+    if (!assigned || (requested && requested !== assigned)) {
+      res.status(404).json({ error: 'brand project not found' });
+      return null;
+    }
+    return assigned;
   }
 
   // GET /api/brands — list every stored brand as a summary.
@@ -210,10 +226,8 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
   app.post('/api/brands/:id/preview', async (req: Request, res: Response) => {
     if (!requireBrandVisible(req, res)) return;
     const id = String(req.params.id);
-    const projectId =
-      typeof req.body?.projectId === 'string' && req.body.projectId.trim()
-        ? String(req.body.projectId)
-        : undefined;
+    const projectId = resolveBrandProject(req, res, id);
+    if (projectId === null) return;
     const locale =
       typeof req.body?.locale === 'string' && req.body.locale.trim()
         ? String(req.body.locale)
@@ -242,10 +256,8 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
   app.post('/api/brands/:id/finalize', async (req: Request, res: Response) => {
     if (!requireBrandVisible(req, res)) return;
     const id = String(req.params.id);
-    const projectId =
-      typeof req.body?.projectId === 'string' && req.body.projectId.trim()
-        ? String(req.body.projectId)
-        : undefined;
+    const projectId = resolveBrandProject(req, res, id);
+    if (projectId === null) return;
     const locale =
       typeof req.body?.locale === 'string' && req.body.locale.trim()
         ? String(req.body.locale)
@@ -361,7 +373,13 @@ export function registerBrandRoutes(app: Application, deps: BrandRoutesDeps): vo
         res.status(404).json({ error: 'logo not found' });
         return;
       }
-      res.setHeader('Cache-Control', 'no-cache');
+      if (deps.platform?.enabled) {
+        const mime = mimeFor(logoPath);
+        res.type(mime);
+        setHostedDownloadHeaders(res, mime);
+      } else {
+        res.setHeader('Cache-Control', 'no-cache');
+      }
       res.sendFile(logoPath, { dotfiles: 'allow' }, (err) => {
         if (err && !res.headersSent) {
           res.status(404).json({ error: 'logo not found' });

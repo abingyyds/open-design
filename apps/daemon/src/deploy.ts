@@ -686,6 +686,7 @@ async function setupCloudflarePagesCustomDomain({ config, projectId, selection, 
     dnsOwnership: dns.dnsOwnership,
     domainStatus,
     pagesDomainStatus: typeof domain?.status === 'string' ? domain.status : undefined,
+    bindingVerifiedAt: domainStatus === 'active' ? Date.now() : undefined,
     validationData: domain?.validation_data,
     verificationData: domain?.verification_data,
   };

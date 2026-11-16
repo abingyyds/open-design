@@ -1,3 +1,4 @@
+import { fetchHostedPreview } from '../lib/hosted-preview-fetch';
 import type {
   ConnectorAuthConfigPrepareResponse,
   ConnectorDetail,
@@ -1664,9 +1665,11 @@ export async function fetchProjectFilePreview(
 export async function fetchProjectFileText(
   projectId: string,
   name: string,
-  options?: { cache?: RequestCache; cacheBustKey?: string | number },
+  options?: { cache?: RequestCache; cacheBustKey?: string | number; hostedPreview?: boolean; signal?: AbortSignal; onResponseStatus?: (status: number) => void },
 ): Promise<string | null> {
-  const url = projectFileUrl(projectId, name);
+  const url = options?.hostedPreview
+    ? `/api/projects/${encodeURIComponent(projectId)}/preview-source?file=${encodeURIComponent(name)}`
+    : projectFileUrl(projectId, name);
   const cacheBustKey = options?.cacheBustKey;
   const requestUrl =
     cacheBustKey == null
@@ -1674,9 +1677,11 @@ export async function fetchProjectFileText(
       : `${url}${url.includes('?') ? '&' : '?'}cacheBust=${encodeURIComponent(String(cacheBustKey))}`;
   const init: RequestInit = {};
   if (options?.cache) init.cache = options.cache;
+  if (options?.signal) init.signal = options.signal;
 
   try {
-    const resp = await fetch(requestUrl, init);
+    const resp = await (options?.hostedPreview ? fetchHostedPreview : fetch)(requestUrl, init);
+    options?.onResponseStatus?.(resp.status);
     if (!resp.ok) {
       console.warn('[fetchProjectFileText] failed:', {
         name,
@@ -1689,6 +1694,7 @@ export async function fetchProjectFileText(
     }
     return await resp.text();
   } catch (err) {
+    if (options?.signal?.aborted) return null;
     console.warn('[fetchProjectFileText] failed:', {
       error: err,
       name,
@@ -2349,6 +2355,10 @@ import { LIBRARY_UPLOAD_MAX_BYTES, isLibraryUploadMimeAllowed } from '@open-desi
 /** Raw bytes URL for a library asset (image src / download href). */
 export function libraryAssetRawUrl(id: string): string {
   return `/api/library/assets/${encodeURIComponent(id)}/raw`;
+}
+
+export function libraryAssetPreviewUrl(id: string): string {
+  return `/api/library/assets/${encodeURIComponent(id)}/preview`;
 }
 
 /**

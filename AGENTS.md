@@ -106,6 +106,10 @@ Packaged propagation:
 
 Sanctioned exceptions:
 
+- Each isolated hosted task container has a private, temporary data root. The
+  runner sets its `OD_DATA_DIR` inside the container, and the worker passes
+  that value to the agent and keeps its workspace and runtime home under it.
+  The daemon data root and credentials stay outside the container.
 - `OD_MEDIA_CONFIG_DIR` is a narrow override for `media-config.json` only. It
   is not a second daemon data root.
 - `OD_LEGACY_DATA_DIR` is a migration source for legacy data import only. It is

@@ -5,13 +5,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Express, NextFunction, Request, Response } from 'express';
 import { hostedPlatformEnabled } from './deployment.js';
+import { sendHostedResponses } from './hosted-task-credentials.js';
+import { runHostedTask, type HostedTask } from './hosted-task-runner.js';
 
 const DEFAULT_SUBROUTER_BASE_URL = 'http://subrouter.railway.internal:8080';
 const DEFAULT_PUBLIC_SUBROUTER_BASE_URL = 'https://api.subrouter.com';
 const SESSION_COOKIE = 'od_platform_session';
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const AUTO_KEY_PREFIX = 'open-design-auto';
-const CODEX_PLATFORM_PROVIDER_ID = 'open_design_platform';
 const UPSTREAM_TIMEOUT_MS = 15_000;
 
 export class PlatformError extends Error {
@@ -462,37 +463,6 @@ function slug(value: string, fallback: string): string {
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '');
   return text || fallback;
-}
-
-function userDataDir(dataDir: string, userId: string): string {
-  return path.join(dataDir, 'users', slug(userId, 'user'));
-}
-
-function tomlBasicString(value: string): string {
-  return JSON.stringify(String(value));
-}
-
-function writeCodexPlatformConfig(home: string, baseUrl: string, model: string): void {
-  const lines = [
-    `model_provider = ${tomlBasicString(CODEX_PLATFORM_PROVIDER_ID)}`,
-    ...(model ? [`model = ${tomlBasicString(model)}`] : []),
-    'disable_response_storage = true',
-    '',
-    `[model_providers.${CODEX_PLATFORM_PROVIDER_ID}]`,
-    `name = ${tomlBasicString('Open Design Platform')}`,
-    `base_url = ${tomlBasicString(baseUrl)}`,
-    // SubRouter credentials are injected into the child process environment.
-    // Codex only reads that environment key for configured providers when
-    // first-party OpenAI auth is disabled.  Leaving requires_openai_auth=true
-    // makes Codex look for an auth.json/ChatGPT login in the per-user home and
-    // silently ignores OPENAI_API_KEY, which is why a successful platform
-    // login could still produce an unauthenticated model run.
-    'env_key = "OPENAI_API_KEY"',
-    'wire_api = "responses"',
-    'requires_openai_auth = false',
-    '',
-  ];
-  fs.writeFileSync(path.join(home, 'config.toml'), lines.join('\n'), 'utf8');
 }
 
 export class SubrouterPlatform {
@@ -1042,13 +1012,11 @@ export class SubrouterPlatform {
     ).run(clean, now(), userId);
   }
 
-  runtimeForUser(userId: string) {
+  modelForUser(userId: string): string {
     const row = this.rowForUser(userId);
     if (!row) throw new PlatformError('登录已过期，请重新登录', 401, 'SESSION_EXPIRED');
     const apiKey = normalizeApiKey(row.subrouter_api_key);
     if (!apiKey) throw new PlatformError('当前账号未准备好模型调用密钥，请重新登录');
-    const baseUrl = gatewayBaseUrl(row.subrouter_base_url, this.env);
-    const home = path.join(userDataDir(this.dataDir, userId), 'codex-home');
     const model = String(row.default_model || '');
     if (!model) {
       throw new PlatformError('当前账号没有可用的文本模型，请检查订阅或联系管理员', 503, 'NO_MODELS_AVAILABLE');
@@ -1060,20 +1028,21 @@ export class SubrouterPlatform {
         'MODEL_UNSUPPORTED_FOR_CODEX',
       );
     }
-    fs.mkdirSync(home, { recursive: true });
-    writeCodexPlatformConfig(home, baseUrl, model);
-    return {
-      userId,
-      apiKey,
-      baseUrl,
-      model,
-      agentEnv: {
-        OPENAI_BASE_URL: baseUrl,
-        OPENAI_API_KEY: apiKey,
-        CODEX_API_KEY: apiKey,
-        CODEX_HOME: home,
-      },
-    };
+    return model;
+  }
+
+  /** Internal entry point. The caller controls the worker image, and the
+   * session cookie selects the credential for the lifetime of this task. */
+  async runTaskForRequest(req: Request, task: Omit<HostedTask, 'model'>) {
+    const user = this.sessionUserFromRequest(req);
+    if (!user) throw new PlatformError('请先登录平台账号', 401, 'PLATFORM_LOGIN_REQUIRED');
+    const model = this.modelForUser(user.id);
+    return runHostedTask({ ...task, model }, (body, signal) => {
+      const row = this.rowForUser(user.id);
+      const apiKey = normalizeApiKey(row?.subrouter_api_key);
+      if (!row || !apiKey) throw new PlatformError('当前账号未准备好模型调用密钥，请重新登录');
+      return sendHostedResponses(gatewayBaseUrl(row.subrouter_base_url, this.env), apiKey, model, body, signal);
+    });
   }
 
   publicUser(row: any) {
@@ -1139,6 +1108,18 @@ export class SubrouterPlatform {
 
   currentUser(req: Request) {
     return (req as any).platformUser ?? null;
+  }
+
+  previewSession(req: Request) {
+    const token = parseCookies(req.headers.cookie)[SESSION_COOKIE];
+    const ownerId = this.currentUser(req)?.id;
+    return token && typeof ownerId === 'string' ? { ownerId, sessionId: sha256(token) } : undefined;
+  }
+
+  isPreviewSessionActive(sessionId: string, ownerId: string): boolean {
+    return Boolean(this.db.prepare(
+      'SELECT 1 FROM platform_sessions WHERE token_hash = ? AND user_id = ? AND expires_at > ?',
+    ).get(sessionId, ownerId, now()));
   }
 
   stampProjectMetadata(req: Request, metadata: unknown) {

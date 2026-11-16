@@ -23,7 +23,7 @@ import { createPortal } from 'react-dom';
 import { motion } from 'motion/react';
 import type { LibraryAsset } from '@open-design/contracts';
 import { Button } from '@open-design/components';
-import { libraryAssetElementUrl, libraryAssetFigmaUrl, libraryAssetRawUrl } from '../providers/registry';
+import { libraryAssetElementUrl, libraryAssetFigmaUrl, libraryAssetPreviewUrl, libraryAssetRawUrl } from '../providers/registry';
 import { modalOverlay, modalContent } from '../motion';
 import {
   KindIcon,
@@ -159,7 +159,7 @@ function Stage({ asset }: { asset: LibraryAsset }) {
     case 'design-system':
     case 'html':
       // Opaque-origin sandbox: scripts/animations run, daemon stays unreachable.
-      return <iframe className={styles.stageFrame} src={rawUrl} sandbox="allow-scripts" title={title} />;
+      return <iframe className={styles.stageFrame} src={libraryAssetPreviewUrl(asset.id)} sandbox="allow-scripts" title={title} />;
     case 'font':
       return <FontSpecimen asset={asset} rawUrl={rawUrl} />;
     case 'color':

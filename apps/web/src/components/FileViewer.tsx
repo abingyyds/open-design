@@ -1,12 +1,16 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
+import { useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 import { Button, Input, Select } from '@open-design/components';
 import { APP_CHROME_FILE_ACTIONS_ID, APP_CHROME_FILE_ACTIONS_SELECTOR } from './AppChromeHeader';
 import {
   buildSocialSharePayload,
+  CLOUDFLARE_PAGES_BINDING_TTL_MS,
+  hasFreshCloudflarePagesBinding,
+  HOSTED_PREVIEW_SANDBOX,
   OPEN_DESIGN_GITHUB_REPO_URL,
   type SocialShareRequest,
   type SocialShareResponse,
+  type CloudflarePagesCustomDomainInfo,
 } from '@open-design/contracts';
 import {
   anonymizeArtifactId,
@@ -63,6 +67,11 @@ import {
   writeProjectTextFileDetailed,
 } from '../providers/registry';
 import type { ProjectFilePreview } from '../providers/registry';
+import { HostedPlatformContext } from '../providers/platform';
+import { hostedPreviewPresentationUrl, projectPreviewFileUrl } from '../runtime/preview-file-url';
+import { HostedPreviewFrame, useHostedPreviewFrameSrc } from './HostedPreviewFrame';
+import { fetchHostedPreview } from '../lib/hosted-preview-fetch';
+import { keepInlinePreviewAlive } from '../runtime/hosted-preview-session';
 import {
   downloadImageDataUrl,
   exportAsJsx,
@@ -407,17 +416,21 @@ function deployResultState(status?: string): 'ready' | 'delayed' | 'protected' |
   return 'ready';
 }
 
-function publicShareUrlForDeployment(deployment?: WebDeploymentInfo | null): string {
+function shareableCloudflareDomain(domain: CloudflarePagesCustomDomainInfo | undefined, hosted: boolean): string {
+  if (domain?.status !== 'ready' || (hosted && !hasFreshCloudflarePagesBinding(domain))) return '';
+  return domain.url?.trim() || '';
+}
+
+function publicShareUrlForDeployment(deployment?: WebDeploymentInfo | null, hosted = false): string {
   if (!deployment) return '';
   const cloudflare = deployment.cloudflarePages;
-  const customDomainUrl = cloudflare?.customDomain?.status === 'ready'
-    ? cloudflare.customDomain.url?.trim()
-    : '';
+  const customDomainUrl = shareableCloudflareDomain(cloudflare?.customDomain, hosted);
   if (customDomainUrl) return customDomainUrl;
   const pagesDevUrl = cloudflare?.pagesDev?.status === 'ready'
     ? cloudflare.pagesDev.url?.trim()
     : '';
   if (pagesDevUrl) return pagesDevUrl;
+  if (hosted && cloudflare) return '';
   return deployResultState(deployment.status) === 'ready'
     ? deployment.url?.trim() || ''
     : '';
@@ -719,14 +732,23 @@ function compareDeploymentsByNewest(a: WebDeploymentInfo, b: WebDeploymentInfo):
   return deploymentTimestamp(b) - deploymentTimestamp(a);
 }
 
-function shareUrlForDeployment(deployment: WebDeploymentInfo): string {
+function shareUrlForDeployment(deployment: WebDeploymentInfo, hosted = false): string {
   const customDomain = deployment.providerId === CLOUDFLARE_PAGES_PROVIDER_ID
     ? deployment.cloudflarePages?.customDomain
     : undefined;
-  if (customDomain?.status === 'ready' && customDomain.url?.trim()) {
-    return customDomain.url.trim();
+  const customDomainUrl = shareableCloudflareDomain(customDomain, hosted);
+  if (customDomainUrl) return customDomainUrl;
+  if (hosted && deployment.cloudflarePages) {
+    const pagesDev = deployment.cloudflarePages.pagesDev;
+    return pagesDev?.status === 'failed' ? '' : pagesDev?.url?.trim() || '';
   }
   return deployment.url?.trim() || '';
+}
+
+function shareLinkState(deployment: WebDeploymentInfo, url: string) {
+  const { pagesDev, customDomain } = deployment.cloudflarePages ?? {};
+  if (customDomain?.status === 'ready' && customDomain.url?.trim() === url) return 'ready';
+  return deployResultState(pagesDev?.url?.trim() === url ? pagesDev?.status : deployment.status);
 }
 
 function resolveShareUrl(rawUrl: string): string {
@@ -739,10 +761,11 @@ function resolveShareUrl(rawUrl: string): string {
 
 function pickLatestShareDeployment(
   deploymentsByProvider: Partial<Record<WebDeployProviderId, WebDeploymentInfo>>,
+  hosted: boolean,
 ): WebDeploymentInfo | null {
   return Object.values(deploymentsByProvider)
     .filter((deployment): deployment is WebDeploymentInfo =>
-      Boolean(deployment && shareUrlForDeployment(deployment) && deployResultState(deployment.status) !== 'failed'))
+      Boolean(deployment && shareUrlForDeployment(deployment, hosted) && deployResultState(deployment.status) !== 'failed'))
     .sort(compareDeploymentsByNewest)[0] ?? null;
 }
 
@@ -4452,6 +4475,9 @@ function HtmlViewer({
   slideNavRequest?: { slideIndex: number; nonce: number } | null;
 }) {
   const { locale, t } = useI18n();
+  const hosted = useContext(HostedPlatformContext);
+  const [previewSourceTooLarge, setPreviewSourceTooLarge] = useState(false);
+  const [previewSourceBusy, setPreviewSourceBusy] = useState(false);
   const analytics = useAnalytics();
   // Latest per-slide capture progress for the programmatic exporters, read by
   // the loading-toast ticker in fireShareExport to render elapsed time + ETA.
@@ -4718,7 +4744,7 @@ function HtmlViewer({
   const [deployResult, setDeployResult] = useState<WebDeployProjectFileResponse | null>(null);
   const [copiedDeployLink, setCopiedDeployLink] = useState<string | null>(null);
   const [deployProviderId, setDeployProviderId] = useState<WebDeployProviderId>(DEFAULT_DEPLOY_PROVIDER_ID);
-  const [projectSocialShare, setProjectSocialShare] = useState<SocialShareResponse | null>(null);
+  const [projectSocialShare, setProjectSocialShare] = useState<{ key: string; payload: SocialShareResponse } | null>(null);
   const [deployToken, setDeployToken] = useState('');
   const [teamId, setTeamId] = useState('');
   const [teamSlug, setTeamSlug] = useState('');
@@ -5240,6 +5266,8 @@ function HtmlViewer({
 
   useEffect(() => {
     const sourceFileKey = `${projectId}\0${file.name}\0${liveHtml === undefined ? 'raw' : 'live'}`;
+    setPreviewSourceTooLarge(false);
+    setPreviewSourceBusy(false);
     if (liveHtml !== undefined) {
       sourceFileKeyRef.current = sourceFileKey;
       setSource(liveHtml);
@@ -5253,6 +5281,7 @@ function HtmlViewer({
       sourceRef.current = null;
     }
     let cancelled = false;
+    const controller = new AbortController();
     // Cache-bust the fetch on every mtime / reload / files-refresh bump.
     // Without this, an agent edit during Comment mode (srcDoc path) gets
     // stale HTML from the browser HTTP cache — the source state ends up
@@ -5262,6 +5291,15 @@ function HtmlViewer({
     // url-load iframe takes over with its own ?v=mtime cache-bust.
     void fetchProjectFileText(projectId, file.name, {
       cacheBustKey: `${file.mtime}-${reloadKey}-${filesRefreshKey}`,
+      ...(hosted ? {
+        hostedPreview: true,
+        signal: controller.signal,
+        onResponseStatus: (status: number) => {
+          if (cancelled) return;
+          setPreviewSourceTooLarge(status === 413);
+          setPreviewSourceBusy(status === 429);
+        },
+      } : {}),
     }).then((text) => {
       if (cancelled) return;
       // Chokidar emits agent rewrites as unlink+add+change bursts; a
@@ -5273,8 +5311,9 @@ function HtmlViewer({
     });
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [projectId, file.name, file.mtime, liveHtml, reloadKey, filesRefreshKey]);
+  }, [projectId, file.name, file.mtime, liveHtml, reloadKey, filesRefreshKey, hosted]);
 
   useEffect(() => {
     let cancelled = false;
@@ -5373,10 +5412,37 @@ function HtmlViewer({
     needsFocusGuard,
   };
   const useUrlLoadPreview = shouldUrlLoadHtmlPreview(urlLoadDecision) && !manualEditRequiresSrcDoc;
+  const previewSandbox = hosted ? HOSTED_PREVIEW_SANDBOX : 'allow-scripts allow-downloads';
+  const previewFileUrl = hosted ? projectPreviewFileUrl : projectRawUrl;
   const basePreviewSrcUrl = useMemo(
-    () => `${projectRawUrl(projectId, file.name)}?v=${Math.round(file.mtime)}&r=${reloadKey}&odPreviewBridge=scroll&odPreviewBridge=selection&odPreviewBridge=snapshot`,
-    [projectId, file.name, file.mtime, reloadKey],
+    () => `${previewFileUrl(projectId, file.name)}?v=${Math.round(file.mtime)}&r=${reloadKey}&odPreviewBridge=scroll&odPreviewBridge=selection&odPreviewBridge=snapshot`,
+    [previewFileUrl, projectId, file.name, file.mtime, reloadKey],
   );
+  const [hostedScope, setHostedScope] = useState<{ requestUrl: string; baseUrl: string } | null>(null);
+  const [scopeRevision, setScopeRevision] = useState(0);
+  const [previewScopeBusy, setPreviewScopeBusy] = useState(false);
+  const needsHostedScope = hosted && !useUrlLoadPreview && !streaming && Boolean(source);
+  useEffect(() => {
+    setPreviewScopeBusy(false);
+    if (!needsHostedScope) return;
+    const controller = new AbortController();
+    const mintUrl = `/api/projects/${encodeURIComponent(projectId)}/preview-url?file=${encodeURIComponent(file.name)}`;
+    void fetchHostedPreview(mintUrl, { cache: 'no-store', signal: controller.signal }).then(async (response) => {
+      if (controller.signal.aborted) return;
+      setPreviewScopeBusy(response.status === 429);
+      if (!response.ok) return;
+      const result = await response.json() as { url?: string };
+      if (result.url?.startsWith('/api/hosted-preview/') && !controller.signal.aborted) {
+        setHostedScope({ requestUrl: basePreviewSrcUrl, baseUrl: result.url });
+      }
+    }).catch(() => {});
+    return () => controller.abort();
+  }, [needsHostedScope, basePreviewSrcUrl, projectId, file.name, scopeRevision]);
+  const scopedBaseUrl = hosted && hostedScope?.requestUrl === basePreviewSrcUrl ? hostedScope.baseUrl : null;
+  useEffect(() => {
+    if (!needsHostedScope || !scopedBaseUrl) return;
+    return keepInlinePreviewAlive(scopedBaseUrl, () => setScopeRevision((value) => value + 1));
+  }, [needsHostedScope, scopedBaseUrl]);
   const [previewSrcUrl, setPreviewSrcUrl] = useState(basePreviewSrcUrl);
   // Hold the iframe URL still (it carries file.mtime) while the user is mid
   // annotation/edit, mirroring the source freeze above. Otherwise a
@@ -5443,18 +5509,19 @@ function HtmlViewer({
     if (interactivePreviewModeActive) return;
     const nextSrc = `${effectiveBasePreviewSrcUrl}&fr=${filesRefreshKey}`;
     const timeout = window.setTimeout(() => {
-      if (useUrlLoadPreview && urlPreviewIframeRef.current?.contentWindow) {
+      // Hosted navigation must update the parent-owned src and its binding.
+      if (!hosted && useUrlLoadPreview && urlPreviewIframeRef.current?.contentWindow) {
         urlPreviewIframeRef.current.contentWindow.location.replace(nextSrc);
       } else {
         setPreviewSrcUrl(nextSrc);
       }
     }, 180);
     return () => window.clearTimeout(timeout);
-  }, [effectiveBasePreviewSrcUrl, filesRefreshKey, useUrlLoadPreview, interactivePreviewModeActive]);
+  }, [effectiveBasePreviewSrcUrl, filesRefreshKey, hosted, useUrlLoadPreview, interactivePreviewModeActive]);
 
   useEffect(() => {
     setInlinedSource(null);
-    if (useUrlLoadPreview) return;
+    if (useUrlLoadPreview || hosted) return;
     if (!source || effectiveDeck || !hasRelativeAssetRefs(source)) return;
     let cancelled = false;
     void inlineRelativeAssets(source, projectId, file.name).then((next) => {
@@ -5463,12 +5530,13 @@ function HtmlViewer({
     return () => {
       cancelled = true;
     };
-  }, [source, effectiveDeck, projectId, file.name, reloadKey, useUrlLoadPreview]);
+  }, [source, effectiveDeck, projectId, file.name, reloadKey, useUrlLoadPreview, hosted]);
 
   const srcDoc = useMemo(
     () => (previewSource ? buildSrcdoc(previewSource, {
+      hosted,
       deck: effectiveDeck,
-      baseHref: projectRawUrl(projectId, baseDirFor(file.name)),
+      baseHref: scopedBaseUrl ?? projectRawUrl(projectId, baseDirFor(file.name)),
       initialSlideIndex: htmlPreviewSlideState.get(previewStateKey)?.active ?? 0,
       selectionBridge: true,
       // Always inject the manual-edit bridge into the PREVIEW srcDoc (not the
@@ -5484,9 +5552,9 @@ function HtmlViewer({
       paletteBridge: false,
       previewFocusGuard: true,
     }) : ''),
-    [previewSource, effectiveDeck, projectId, file.name, previewStateKey],
+    [hosted, scopedBaseUrl, previewSource, effectiveDeck, projectId, file.name, previewStateKey],
   );
-  const lazySrcDocTransport = useMemo(() => buildLazySrcdocTransport(), []);
+  const lazySrcDocTransport = useMemo(() => buildLazySrcdocTransport(hosted), [hosted]);
   const [srcDocTransportResetKey, setSrcDocTransportResetKey] = useState(0);
   const [srcDocShellReady, setSrcDocShellReady] = useState(false);
   // Sticky once the srcDoc iframe has materialized the real artifact for the
@@ -5570,6 +5638,7 @@ function HtmlViewer({
     shouldUrlLoadHtmlPreview({ ...urlLoadDecision, drawMode: false });
   const urlTransportSrc =
     useUrlLoadPreview || srcDocForcedOnlyByDraw ? activePreviewSrcUrl : 'about:blank';
+  const boundUrlTransportSrc = useHostedPreviewFrameSrc(urlTransportSrc, hosted);
   const activateSrcDocTransport = useCallback((target: HTMLIFrameElement | null = srcDocPreviewIframeRef.current) => {
     if (!canActivateSrcDocTransport({
       srcDoc,
@@ -7051,6 +7120,10 @@ function HtmlViewer({
 
   function openInNewTab() {
     if (!source) return;
+    if (hosted) {
+      window.open(hostedPreviewPresentationUrl(projectId, file.name), '_blank', 'noopener,noreferrer');
+      return;
+    }
     openSandboxedPreviewInNewTab(source, exportTitle, {
       deck: effectiveDeck,
       baseHref: projectRawUrl(projectId, baseDirFor(file.name)),
@@ -8116,6 +8189,25 @@ function HtmlViewer({
     ? activeDeployment.cloudflarePages
     : undefined;
   const activeCloudflareCustomDomain = activeCloudflarePages?.customDomain;
+  const [, refreshBindingStatus] = useState(0);
+  const nextBindingExpiry = hosted ? Math.min(...[
+    activeCloudflareCustomDomain,
+    deploymentsByProvider[CLOUDFLARE_PAGES_PROVIDER_ID]?.cloudflarePages?.customDomain,
+  ].flatMap((domain) => (
+    shareableCloudflareDomain(domain, true) && domain?.bindingVerifiedAt != null
+      ? [domain.bindingVerifiedAt + CLOUDFLARE_PAGES_BINDING_TTL_MS]
+      : []
+  ))) : Infinity;
+  useEffect(() => {
+    if (!Number.isFinite(nextBindingExpiry)) return;
+    const refresh = () => refreshBindingStatus((value) => value + 1);
+    const timer = window.setTimeout(refresh, Math.max(0, nextBindingExpiry - Date.now()));
+    document.addEventListener('visibilitychange', refresh);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', refresh);
+    };
+  }, [nextBindingExpiry]);
   const deployProvider = getDeployProviderOption(deployProviderId);
   const deployProviderLabel = t(deployProvider.labelKey);
   const selectedCloudflareZone = cloudflareZones.find((zone) => zone.id === cloudflareZoneId) ?? null;
@@ -8127,7 +8219,7 @@ function HtmlViewer({
   const deployResultCards: DeployResultCard[] = activeCloudflarePages
     ? (() => {
         const cards: DeployResultCard[] = [];
-        const pagesDevUrl = activeCloudflarePages.pagesDev?.url || activeDeployedUrl;
+        const pagesDevUrl = activeCloudflarePages.pagesDev?.url || (hosted ? '' : activeDeployedUrl);
         if (pagesDevUrl) {
           cards.push({
             id: 'pages-dev',
@@ -8142,7 +8234,9 @@ function HtmlViewer({
             id: 'custom-domain',
             label: t('fileViewer.cloudflareCustomDomainLinkLabel'),
             url: activeCloudflareCustomDomain.url,
-            status: activeCloudflareCustomDomain.status,
+            status: hosted && activeCloudflareCustomDomain.status === 'ready'
+              && !shareableCloudflareDomain(activeCloudflareCustomDomain, true)
+              ? 'pending' : activeCloudflareCustomDomain.status,
             message:
               activeCloudflareCustomDomain.errorMessage ||
               activeCloudflareCustomDomain.statusMessage,
@@ -8178,29 +8272,35 @@ function HtmlViewer({
   const deployedEntries = DEPLOY_PROVIDER_OPTIONS
     .map((option) => deploymentsByProvider[option.id])
     .filter((item): item is WebDeploymentInfo => Boolean(item?.url?.trim()));
-  const shareableDeploymentUrl =
+  const pickPublicShareUrl = () =>
     DEPLOY_PROVIDER_OPTIONS.map((option) => deploymentsByProvider[option.id])
-      .map((item) => publicShareUrlForDeployment(item))
+      .map((item) => publicShareUrlForDeployment(item, hosted))
       .find(Boolean) ?? '';
+  const shareableDeploymentUrl = pickPublicShareUrl();
   const socialShareBlockedDeployment =
     shareableDeploymentUrl
       ? null
-      : deployedEntries.find((item) => deployResultState(item.status) === 'protected' && !publicShareUrlForDeployment(item)) ??
-        deployedEntries.find((item) => !publicShareUrlForDeployment(item)) ??
+      : deployedEntries.find((item) => deployResultState(item.status) === 'protected' && !publicShareUrlForDeployment(item, hosted)) ??
+        deployedEntries.find((item) => !publicShareUrlForDeployment(item, hosted)) ??
         null;
   const socialShareBlockedState = socialShareBlockedDeployment
     ? deployResultState(socialShareBlockedDeployment.status)
     : null;
-  const socialShareDisplayUrl =
-    shareableDeploymentUrl || socialShareBlockedDeployment?.url?.trim() || activeDeployedUrl;
+  const pickSocialShareDisplayUrl = (publicUrl: string) => {
+    if (publicUrl) return publicUrl;
+    const fallback = socialShareBlockedDeployment ?? activeDeployment;
+    if (!fallback || (hosted && fallback.cloudflarePages)) return '';
+    return shareUrlForDeployment(fallback, hosted);
+  };
+  const socialShareDisplayUrl = pickSocialShareDisplayUrl(shareableDeploymentUrl);
   const socialShareUnavailableMessage =
     socialShareBlockedState === 'protected'
       ? t('fileViewer.deployLinkProtected')
       : socialShareBlockedState === 'delayed'
         ? t('fileViewer.deployLinkDelayed')
         : t('socialShare.deployFirst');
-  const projectSocialShareRequest = useMemo<SocialShareRequest | null>(() => {
-    if (!socialShareDisplayUrl) return null;
+  const makeProjectSocialShareRequest = useCallback((url: string): SocialShareRequest | null => {
+    if (!url) return null;
     const title = t('socialShare.projectTitle', { title: exportTitle });
     const text = t('socialShare.projectText', {
       title: exportTitle,
@@ -8209,16 +8309,20 @@ function HtmlViewer({
     return {
       kind: 'project-html',
       locale,
-      url: socialShareDisplayUrl,
+      url,
       title,
       text,
       copyText: t('socialShare.projectCopyText', {
         title: exportTitle,
-        url: socialShareDisplayUrl,
+        url,
         repo: OPEN_DESIGN_GITHUB_REPO_URL,
       }),
     };
-  }, [exportTitle, locale, socialShareDisplayUrl, t]);
+  }, [exportTitle, locale, t]);
+  const projectSocialShareRequest = useMemo(
+    () => makeProjectSocialShareRequest(socialShareDisplayUrl),
+    [makeProjectSocialShareRequest, socialShareDisplayUrl],
+  );
   const projectSocialShareFallback = useMemo(
     () => (projectSocialShareRequest ? buildSocialSharePayload(projectSocialShareRequest) : null),
     [projectSocialShareRequest],
@@ -8238,7 +8342,7 @@ function HtmlViewer({
     let cancelled = false;
     void createSocialSharePayload(projectSocialShareRequest)
       .then((payload) => {
-        if (!cancelled) setProjectSocialShare(payload);
+        if (!cancelled && payload) setProjectSocialShare({ key: projectSocialShareKey, payload });
       })
       .catch(() => {
         if (!cancelled) setProjectSocialShare(null);
@@ -8248,7 +8352,27 @@ function HtmlViewer({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectSocialShareKey]);
-  const activeProjectSocialShare = projectSocialShare ?? projectSocialShareFallback;
+  const activeProjectSocialShare = projectSocialShare?.key === projectSocialShareKey
+    ? projectSocialShare.payload : projectSocialShareFallback;
+  function currentSocialShare() {
+    const url = pickSocialShareDisplayUrl(pickPublicShareUrl());
+    if (url === socialShareDisplayUrl) return activeProjectSocialShare;
+    const request = makeProjectSocialShareRequest(url);
+    return request ? buildSocialSharePayload(request) : null;
+  }
+
+  function currentDeployCardUrl(card: DeployResultCard) {
+    if (hosted && card.id === 'pages-dev' && deployResultState(card.status) === 'failed') return '';
+    if (!hosted || card.id !== 'custom-domain') return card.url;
+    return shareableCloudflareDomain(activeCloudflareCustomDomain, true)
+      || publicShareUrlForDeployment(activeDeployment, true);
+  }
+
+  function followUpdatedShareLink(event: ReactMouseEvent<HTMLAnchorElement>, url: string) {
+    if (url === event.currentTarget.getAttribute('href')) return;
+    event.preventDefault();
+    if (url) window.open(url, '_blank', 'noopener,noreferrer');
+  }
   const socialShareMenuLabel =
     activeProjectSocialShare
       ? t('socialShare.projectSection')
@@ -8261,22 +8385,20 @@ function HtmlViewer({
     if (providerId === 'cloudflare-pages') return 'pages-line';
     return 'upload-cloud-line';
   };
-  const latestShareDeployment = useMemo(
-    () => pickLatestShareDeployment(deploymentsByProvider),
-    [deploymentsByProvider],
-  );
+  const latestShareDeployment = pickLatestShareDeployment(deploymentsByProvider, hosted);
   const latestDeployedShareUrl = latestShareDeployment
-    ? shareUrlForDeployment(latestShareDeployment)
+    ? shareUrlForDeployment(latestShareDeployment, hosted)
     : '';
   const latestShareState = latestShareDeployment
-    ? deployResultState(latestShareDeployment.status)
+    ? shareLinkState(latestShareDeployment, latestDeployedShareUrl)
     : null;
   const sharePageUrl = useMemo(
     () => resolveShareUrl(latestDeployedShareUrl),
     [latestDeployedShareUrl],
   );
   const canCopyShareLink = !streaming && Boolean(sharePageUrl);
-  const canOpenSharePage = !streaming && Boolean(sharePageUrl) && latestShareState !== 'delayed';
+  const canOpenSharePage = !streaming && Boolean(sharePageUrl)
+    && latestShareState !== 'delayed' && latestShareState !== 'failed';
   const shareLinkStatusHint =
     streaming
       ? t('fileViewer.shareAfterGenerationComplete')
@@ -8879,9 +9001,13 @@ function HtmlViewer({
                             disabled={!canCopyShareLink}
                             title={!canCopyShareLink ? shareUnavailableHint : shareLinkStatusHint || undefined}
                             onClick={() => {
-                              if (!canCopyShareLink || !sharePageUrl) return;
+                              if (streaming) return;
+                              const deployment = pickLatestShareDeployment(deploymentsByProvider, hosted);
+                              if (!deployment) return;
+                              const url = resolveShareUrl(shareUrlForDeployment(deployment, hosted));
+                              if (!url) return;
                               fireShareExport('share_link', async () => {
-                                const ok = await copyShareLink(sharePageUrl);
+                                const ok = await copyShareLink(url);
                                 if (!ok) throw new Error('copy_share_link_failed');
                               });
                             }}
@@ -8901,10 +9027,16 @@ function HtmlViewer({
                             disabled={!canOpenSharePage}
                             title={!canOpenSharePage ? shareLinkStatusHint || shareUnavailableHint : shareLinkStatusHint || undefined}
                             onClick={() => {
-                              if (!canOpenSharePage || !sharePageUrl) return;
+                              if (streaming) return;
+                              const deployment = pickLatestShareDeployment(deploymentsByProvider, hosted);
+                              if (!deployment) return;
+                              const selected = shareUrlForDeployment(deployment, hosted);
+                              const url = resolveShareUrl(selected);
+                              const state = shareLinkState(deployment, selected);
+                              if (!url || state === 'delayed' || state === 'failed') return;
                               setDeployMenuOpen(false);
                               fireShareExport('share_page', () => {
-                                window.open(sharePageUrl, '_blank', 'noopener');
+                                window.open(url, '_blank', 'noopener');
                               });
                             }}
                           >
@@ -9127,8 +9259,13 @@ function HtmlViewer({
           ) : null}
         </>)}
       <div className="viewer-body" ref={previewBodyRef}>
-        {source === null ? (
-          <div className="viewer-empty">{t('fileViewer.loading')}</div>
+        {previewSourceBusy || (needsHostedScope && previewScopeBusy) ? (
+          <div className="viewer-empty">
+            <div>{t('fileViewer.previewUnavailable')}</div>
+            <Button type="button" variant="ghost" onClick={reloadHtmlPreview}>{t('preview.retry')}</Button>
+          </div>
+        ) : previewSourceTooLarge || source === null ? (
+          <div className="viewer-empty">{t(previewSourceTooLarge ? 'fileViewer.previewUnavailable' : 'fileViewer.loading')}</div>
         ) : mode === 'preview' ? (
           <div
             className={`${manualEditMode ? 'manual-edit-workspace' : commentPreviewLayoutClass} preview-viewport preview-viewport-${previewViewport}${drawOverlayOpen ? ' preview-draw-active' : ''}`}
@@ -9162,7 +9299,7 @@ function HtmlViewer({
                     onToolbarClick={fireDrawToolbarClick}
                   >
                     <div className="artifact-preview-transport-stack">
-                      {OD_PREVIEW_KEEP_ALIVE ? (
+                      {OD_PREVIEW_KEEP_ALIVE && !hosted ? (
                         <PooledIframe
                           ref={urlPreviewIframeRef}
                           cacheKey={urlPreviewKeepAliveKey}
@@ -9172,7 +9309,7 @@ function HtmlViewer({
                           aria-hidden={useUrlLoadPreview ? undefined : true}
                           tabIndex={useUrlLoadPreview ? 0 : -1}
                           title={file.name}
-                          sandbox="allow-scripts allow-downloads"
+                          sandbox={previewSandbox}
                           src={urlTransportSrc}
                           onLoad={() => {
                             const frame = urlPreviewIframeRef.current;
@@ -9197,8 +9334,8 @@ function HtmlViewer({
                           aria-hidden={useUrlLoadPreview ? undefined : true}
                           tabIndex={useUrlLoadPreview ? 0 : -1}
                           title={file.name}
-                          sandbox="allow-scripts allow-downloads"
-                          src={urlTransportSrc}
+                          sandbox={previewSandbox}
+                          src={boundUrlTransportSrc}
                           onLoad={() => {
                             const frame = urlPreviewIframeRef.current;
                             if (useUrlLoadPreview) iframeRef.current = frame;
@@ -9223,7 +9360,7 @@ function HtmlViewer({
                         aria-hidden={useUrlLoadPreview ? true : undefined}
                         tabIndex={useUrlLoadPreview ? -1 : 0}
                         title={file.name}
-                        sandbox="allow-scripts allow-downloads"
+                        sandbox={previewSandbox}
                         srcDoc={srcDocTransportContent}
                         onLoad={() => {
                           const frame = srcDocPreviewIframeRef.current;
@@ -9475,16 +9612,16 @@ function HtmlViewer({
             <Icon name="close" size={13} /> {t('fileViewer.exitPresentation')}
           </button>
           {useUrlLoadPreview ? (
-            <iframe
+            <HostedPreviewFrame
               title="present"
-              sandbox="allow-scripts allow-downloads"
+              sandbox={previewSandbox}
               data-od-render-mode="url-load"
               src={activePreviewSrcUrl}
             />
           ) : (
             <iframe
               title="present"
-              sandbox="allow-scripts allow-downloads"
+              sandbox={previewSandbox}
               data-od-render-mode="srcdoc"
               srcDoc={srcDoc}
             />
@@ -9653,6 +9790,7 @@ function HtmlViewer({
                         href={socialShareDisplayUrl}
                         target="_blank"
                         rel="noreferrer noopener"
+                        onClick={hosted ? (event) => followUpdatedShareLink(event, pickSocialShareDisplayUrl(pickPublicShareUrl())) : undefined}
                       >
                         {socialShareDisplayUrl}
                       </a>
@@ -9664,16 +9802,18 @@ function HtmlViewer({
                   {activeProjectSocialShare ? (
                     <SocialShareGrid
                       share={activeProjectSocialShare}
+                      resolveShare={hosted ? currentSocialShare : undefined}
                       onAfterShare={closeDeployModal}
                     />
                   ) : null}
-                  {socialShareBlockedDeployment?.url ? (
+                  {socialShareBlockedDeployment?.url && socialShareDisplayUrl ? (
                     <div className="deploy-social-share__actions">
                       <button
                         type="button"
                         className="viewer-action"
                         onClick={() => {
-                          void copyDeployLink(socialShareBlockedDeployment.url);
+                          const url = hosted ? pickSocialShareDisplayUrl(pickPublicShareUrl()) : socialShareBlockedDeployment.url;
+                          if (url) void copyDeployLink(url);
                         }}
                       >
                         <Icon name="copy" size={14} />
@@ -9866,7 +10006,11 @@ function HtmlViewer({
                       {deployResultCards.map((card) => {
                         const state = deployResultState(card.status);
                         const canRetry = state === 'delayed' || state === 'protected';
-                        const isDisabled = state === 'protected' || state === 'failed';
+                        const unverifiedCustomDomain = hosted && card.id === 'custom-domain'
+                          && !shareableCloudflareDomain(activeCloudflareCustomDomain, true);
+                        const unavailableHostedLink = unverifiedCustomDomain
+                          || (hosted && card.id === 'pages-dev' && state === 'failed');
+                        const isDisabled = unverifiedCustomDomain || state === 'protected' || state === 'failed';
                         return (
                           <div key={card.id} className={`deploy-result-link ${state}`}>
                             <div className="deploy-result-link-main">
@@ -9877,14 +10021,19 @@ function HtmlViewer({
                               {card.message ? (
                                 <p className="deploy-result-link-message">{card.message}</p>
                               ) : null}
-                              <a
-                                className="deploy-result-url"
-                                href={card.url}
-                                target="_blank"
-                                rel="noreferrer noopener"
-                              >
-                                {card.url}
-                              </a>
+                              {unavailableHostedLink ? (
+                                <span className="deploy-result-url">{card.url}</span>
+                              ) : (
+                                <a
+                                  className="deploy-result-url"
+                                  href={card.url}
+                                  target="_blank"
+                                  rel="noreferrer noopener"
+                                  onClick={(event) => followUpdatedShareLink(event, currentDeployCardUrl(card))}
+                                >
+                                  {card.url}
+                                </a>
+                              )}
                             </div>
                             <div className="deploy-result-actions">
                               {canRetry ? (
@@ -9904,8 +10053,10 @@ function HtmlViewer({
                               <button
                                 type="button"
                                 className="viewer-action"
+                                disabled={unavailableHostedLink}
                                 onClick={() => {
-                                  void copyDeployLink(card.url);
+                                  const url = currentDeployCardUrl(card);
+                                  if (url) void copyDeployLink(url);
                                 }}
                               >
                                 <Icon name="copy" size={14} />
@@ -9917,6 +10068,7 @@ function HtmlViewer({
                                 target="_blank"
                                 rel="noreferrer noopener"
                                 aria-disabled={isDisabled}
+                                onClick={(event) => followUpdatedShareLink(event, isDisabled ? '' : currentDeployCardUrl(card))}
                               >
                                 <Icon name="upload" size={14} />
                                 {t('fileViewer.open')}

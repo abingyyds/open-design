@@ -72,6 +72,7 @@ import {
   spawnEnvForAgent,
 } from './agents.js';
 import { agentCliEnvForAgent, readAppConfig } from './app-config.js';
+import { hostedPlatformEnabled } from './platform/deployment.js';
 import { createJsonEventStreamHandler } from './runtimes/json-event-stream.js';
 
 const SYSTEM_PROMPT = `You are a memory extractor for a personal AI design assistant.
@@ -1181,6 +1182,7 @@ async function collectProposedEntries(dataDir, input, options) {
 }
 
 export async function suggestWithLLM(dataDir, input, options) {
+  if (hostedPlatformEnabled()) return [];
   const result = await collectProposedEntries(dataDir, input, options);
   if (result.status !== 'ok') return [];
 
@@ -1266,6 +1268,7 @@ export async function distillAnnotationsToMemory(dataDir, input, options) {
 }
 
 export async function extractWithLLM(dataDir, input, options) {
+  if (hostedPlatformEnabled()) return [];
   const changeSource = options?.source ?? 'llm';
   const result = await collectProposedEntries(dataDir, input, options);
   if (result.status !== 'ok') return [];

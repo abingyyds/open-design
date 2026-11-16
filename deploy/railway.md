@@ -37,8 +37,8 @@ Create one Railway Volume and mount it at:
 /data
 ```
 
-Open Design stores the platform SQLite database, per-user Codex home
-directories, projects, uploads, and runtime state under this path.
+See the [daemon data directory contract](../AGENTS.md#daemon-data-directory-contract)
+for the volume and isolated hosted-task data roots.
 
 ## Deploy
 
@@ -50,3 +50,21 @@ directories, projects, uploads, and runtime state under this path.
 6. Keep the existing volume mounted.
 7. Deploy and verify that `/api/health` returns `ok: true` and
    `maintenance: true`, and that the public home page returns HTTP 503.
+
+## Local hosted task isolation check
+
+Run from the repository root with a local Docker engine:
+
+```sh
+corepack pnpm --filter @open-design/daemon build
+docker build -f deploy/hosted-worker.Dockerfile -t open-design-hosted-worker:local-isolation apps/daemon
+od_test_image=$(docker image inspect open-design-hosted-worker:local-isolation --format '{{.Id}}')
+OD_HOSTED_TEST_IMAGE="$od_test_image" corepack pnpm --filter @open-design/daemon exec vitest run -c vitest.config.ts tests/platform/hosted-task-isolation.test.ts
+```
+
+The tests use real Codex workers, a local fixture gateway, and synthetic
+credentials. They exercise both the internal Worker boundary and the
+authenticated run and chat routes, including event streaming, file transfer,
+cancellation, and cleanup. The test harness enables the hosted listener on
+loopback and sets `OD_HOSTED_WORKER_IMAGE` to the id of the local fixture image.
+The deployed hosted service continues to start in maintenance mode.

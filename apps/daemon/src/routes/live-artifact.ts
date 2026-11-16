@@ -1,7 +1,10 @@
-import type { Express } from 'express';
+import type { Express, Request, Response } from 'express';
+import { hasExternalProjectRoot } from '../projects.js';
 import type { RouteDeps } from '../server-context.js';
 
-export interface RegisterLiveArtifactRoutesDeps extends RouteDeps<'db' | 'http' | 'paths' | 'auth' | 'liveArtifacts' | 'projectStore'> {}
+export interface RegisterLiveArtifactRoutesDeps extends RouteDeps<'db' | 'http' | 'paths' | 'auth' | 'liveArtifacts' | 'projectStore'> {
+  platform?: { enabled: boolean; projectBelongsToRequest(req: Request, project: unknown): boolean };
+}
 
 export function registerLiveArtifactRoutes(app: Express, ctx: RegisterLiveArtifactRoutesDeps) {
   const { db } = ctx;
@@ -9,7 +12,30 @@ export function registerLiveArtifactRoutes(app: Express, ctx: RegisterLiveArtifa
   const { PROJECTS_DIR } = ctx.paths;
   const { authorizeToolRequest, requestProjectOverride, requestRunOverride } = ctx.auth;
   const { createLiveArtifact, listLiveArtifacts, updateLiveArtifact, refreshLiveArtifact, emitLiveArtifactEvent, emitLiveArtifactRefreshEvent, readLiveArtifactCode, setLiveArtifactCodeHeaders, ensureLiveArtifactPreview, setLiveArtifactPreviewHeaders, getLiveArtifact, listLiveArtifactRefreshLogEntries, deleteLiveArtifact } = ctx.liveArtifacts;
-  const { updateProject } = ctx.projectStore;
+  const { getProject, updateProject } = ctx.projectStore;
+  const requireManagedProject = (req: Request, res: Response, projectId: string): boolean => {
+    if (!ctx.platform?.enabled) return true;
+    const project = getProject(db, projectId);
+    if (!project || !ctx.platform.projectBelongsToRequest(req, project)) {
+      sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+      return false;
+    }
+    if (hasExternalProjectRoot(project.metadata)) {
+      sendApiError(res, 403, 'FORBIDDEN', 'Hosted projects cannot access server directories');
+      return false;
+    }
+    res.setHeader('Cache-Control', 'private, no-store');
+    return true;
+  };
+  if (ctx.platform?.enabled) {
+    app.use('/api/live-artifacts', (req, res, next) => {
+      const projectId = req.query.projectId;
+      if (typeof projectId !== 'string' || !projectId) {
+        return sendApiError(res, 400, 'BAD_REQUEST', 'projectId query parameter is required');
+      }
+      if (requireManagedProject(req, res, projectId)) next();
+    });
+  }
   app.get('/api/live-artifacts', async (req, res) => {
     try {
       const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : undefined;
@@ -105,6 +131,7 @@ export function registerLiveArtifactRoutes(app: Express, ctx: RegisterLiveArtifa
     try {
       const toolGrant = authorizeToolRequest(req, res, 'live-artifacts:create');
       if (!toolGrant) return;
+      if (!requireManagedProject(req, res, toolGrant.projectId)) return;
       const { projectId, input, templateHtml, provenanceJson, createdByRunId } = req.body || {};
       if (requestProjectOverride(projectId, toolGrant.projectId)) {
         return sendApiError(res, 403, 'FORBIDDEN', 'projectId is derived from the tool token', {
@@ -136,6 +163,7 @@ export function registerLiveArtifactRoutes(app: Express, ctx: RegisterLiveArtifa
     try {
       const toolGrant = authorizeToolRequest(req, res, 'live-artifacts:list');
       if (!toolGrant) return;
+      if (!requireManagedProject(req, res, toolGrant.projectId)) return;
       const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : undefined;
       if (requestProjectOverride(projectId, toolGrant.projectId)) {
         return sendApiError(res, 403, 'FORBIDDEN', 'projectId is derived from the tool token', {
@@ -157,6 +185,7 @@ export function registerLiveArtifactRoutes(app: Express, ctx: RegisterLiveArtifa
     try {
       const toolGrant = authorizeToolRequest(req, res, 'live-artifacts:update');
       if (!toolGrant) return;
+      if (!requireManagedProject(req, res, toolGrant.projectId)) return;
       const { projectId, artifactId, input, templateHtml, provenanceJson } = req.body || {};
       if (requestProjectOverride(projectId, toolGrant.projectId)) {
         return sendApiError(res, 403, 'FORBIDDEN', 'projectId is derived from the tool token', {
@@ -186,6 +215,7 @@ export function registerLiveArtifactRoutes(app: Express, ctx: RegisterLiveArtifa
     try {
       const toolGrant = authorizeToolRequest(req, res, 'live-artifacts:refresh');
       if (!toolGrant) return;
+      if (!requireManagedProject(req, res, toolGrant.projectId)) return;
       const { projectId, artifactId } = req.body || {};
       if (requestProjectOverride(projectId, toolGrant.projectId)) {
         return sendApiError(res, 403, 'FORBIDDEN', 'projectId is derived from the tool token', {

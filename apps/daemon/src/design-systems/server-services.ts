@@ -1,4 +1,8 @@
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { isHostedProjectIdRetired } from '../db.js';
+import { hasExternalProjectRoot } from '../projects.js';
+import { hostedPlatformEnabled } from '../platform/deployment.js';
 import path from 'node:path';
 import type Database from 'better-sqlite3';
 
@@ -142,30 +146,27 @@ export function createDesignSystemServerServices({
     if (typeof id === 'string' && id.startsWith('user:')) {
       return designSystems.readDesignSystem(paths.USER_DESIGN_SYSTEMS_DIR, id, { idPrefix: 'user:' });
     }
-    return (
-      (await designSystems.readDesignSystem(paths.DESIGN_SYSTEMS_DIR, id))
-      ?? (await designSystems.readDesignSystem(paths.USER_DESIGN_SYSTEMS_DIR, id))
-    );
+    const bundled = await designSystems.readDesignSystem(paths.DESIGN_SYSTEMS_DIR, id);
+    if (bundled != null || hostedPlatformEnabled()) return bundled ?? null;
+    return designSystems.readDesignSystem(paths.USER_DESIGN_SYSTEMS_DIR, id);
   }
 
   async function readAvailableDesignSystemPackageInfo(id: string) {
     if (typeof id === 'string' && id.startsWith('user:')) {
       return designSystems.readDesignSystemPackageInfo(paths.USER_DESIGN_SYSTEMS_DIR, id, { idPrefix: 'user:' });
     }
-    return (
-      (await designSystems.readDesignSystemPackageInfo(paths.DESIGN_SYSTEMS_DIR, id))
-      ?? (await designSystems.readDesignSystemPackageInfo(paths.USER_DESIGN_SYSTEMS_DIR, id))
-    );
+    const bundled = await designSystems.readDesignSystemPackageInfo(paths.DESIGN_SYSTEMS_DIR, id);
+    if (bundled != null || hostedPlatformEnabled()) return bundled ?? null;
+    return designSystems.readDesignSystemPackageInfo(paths.USER_DESIGN_SYSTEMS_DIR, id);
   }
 
   async function readAvailableDesignSystemStaticFile(id: string, filePath: string) {
     if (typeof id === 'string' && id.startsWith('user:')) {
       return designSystems.readDesignSystemStaticFile(paths.USER_DESIGN_SYSTEMS_DIR, id, filePath, { idPrefix: 'user:' });
     }
-    return (
-      (await designSystems.readDesignSystemStaticFile(paths.DESIGN_SYSTEMS_DIR, id, filePath))
-      ?? (await designSystems.readDesignSystemStaticFile(paths.USER_DESIGN_SYSTEMS_DIR, id, filePath))
-    );
+    const bundled = await designSystems.readDesignSystemStaticFile(paths.DESIGN_SYSTEMS_DIR, id, filePath);
+    if (bundled != null || hostedPlatformEnabled()) return bundled ?? null;
+    return designSystems.readDesignSystemStaticFile(paths.USER_DESIGN_SYSTEMS_DIR, id, filePath);
   }
 
   function isProjectUsableDesignSystem(summary: DesignSystemSummary | null | undefined) {
@@ -259,7 +260,7 @@ export function createDesignSystemServerServices({
     const systems = await listAllDesignSystems();
     const summary = systems.find((s) => s.id === id && s.source === 'user');
     if (!summary) return null;
-    const projectId = projectBackedDesignSystemProjectId(id, summary);
+    let projectId = projectBackedDesignSystemProjectId(id, summary);
     if (!projectId) return null;
 
     const now = Date.now();
@@ -274,30 +275,45 @@ export function createDesignSystemServerServices({
     if (
       existing &&
       options.platformUserId &&
-      existing.metadata?.platformUserId !== options.platformUserId
+      (existing.metadata?.platformUserId !== options.platformUserId || hasExternalProjectRoot(existing.metadata))
     ) {
       // Do not let one hosted user claim or mutate a workspace project that
       // belongs to another tenant (or a legacy unowned tenant).
       return null;
     }
+    let reservedDir: string | undefined;
+    if (options.platformUserId && !existing) {
+      const wantedDir = path.join(paths.PROJECTS_DIR, projectId);
+      if (isHostedProjectIdRetired(dbHandle, projectId) || fs.lstatSync(wantedDir, { throwIfNoEntry: false })) {
+        projectId = randomUUID();
+      }
+      reservedDir = path.join(paths.PROJECTS_DIR, projectId);
+      fs.mkdirSync(reservedDir, { mode: 0o700 });
+    }
     const projectName = summary.title ?? id;
-    const project = existing
-      ? projects.updateProject(dbHandle, projectId, {
-          name: projectName,
-          designSystemId: id,
-          metadata: { ...(existing.metadata ?? {}), ...metadata },
-          updatedAt: now,
-        })
-      : projects.insertProject(dbHandle, {
-          id: projectId,
-          name: projectName,
-          skillId: null,
-          designSystemId: id,
-          pendingPrompt: null,
-          metadata,
-          createdAt: now,
-          updatedAt: now,
-        });
+    let project: ProjectRecord | null | undefined;
+    try {
+      project = existing
+        ? projects.updateProject(dbHandle, projectId, {
+            name: projectName,
+            designSystemId: id,
+            metadata: { ...(existing.metadata ?? {}), ...metadata },
+            updatedAt: now,
+          })
+        : projects.insertProject(dbHandle, {
+            id: projectId,
+            name: projectName,
+            skillId: null,
+            designSystemId: id,
+            pendingPrompt: null,
+            metadata,
+            createdAt: now,
+            updatedAt: now,
+          });
+    } catch (err) {
+      if (reservedDir) await fs.promises.rmdir(reservedDir).catch(() => {});
+      throw err;
+    }
     if (!project) return null;
 
     const files = await designSystems.listUserDesignSystemFiles(paths.USER_DESIGN_SYSTEMS_DIR, id);
@@ -377,10 +393,15 @@ export function createDesignSystemServerServices({
     dbHandle: Database.Database,
     summary: DesignSystemSummary | null | undefined,
     filePath: string,
+    platformUserId?: string | null,
   ) {
     if (!summary?.projectId || !projects.isSafeId(summary.projectId)) return null;
     const project = projects.getProject(dbHandle, summary.projectId);
     if (!project) return null;
+    if (hostedPlatformEnabled() && (
+      !platformUserId || project.metadata?.platformUserId !== platformUserId
+      || hasExternalProjectRoot(project.metadata)
+    )) return null;
     try {
       const file = await projects.readProjectFile(
         paths.PROJECTS_DIR,

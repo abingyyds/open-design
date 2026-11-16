@@ -8,10 +8,18 @@ import { beginAuth, exchangeCodeForToken, refreshAccessToken } from './mcp-oauth
 import { clearToken, getToken, isTokenExpired, readAllTokens, setToken } from './mcp-tokens.js';
 import type { RouteDeps } from './server-context.js';
 
-export interface RegisterMcpRoutesDeps extends RouteDeps<'http' | 'paths' | 'mcp'> {}
+export interface RegisterMcpRoutesDeps extends RouteDeps<'http' | 'paths' | 'mcp'> {
+  platform?: { enabled: boolean };
+}
 
 export function registerMcpRoutes(app: Express, ctx: RegisterMcpRoutesDeps) {
   const { isLocalSameOrigin, resolvedPortRef, sendApiError } = ctx.http;
+  if (ctx.platform?.enabled) {
+    app.use('/api/mcp', (_req, res) =>
+      sendApiError(res, 403, 'FORBIDDEN', 'Host MCP settings are unavailable in hosted mode'),
+    );
+    return;
+  }
   const { OD_BIN, RUNTIME_DATA_DIR, PROJECTS_DIR } = ctx.paths;
   const { pendingAuth, daemonUrlRef } = ctx.mcp;
   const getResolvedPort = () => resolvedPortRef.current;

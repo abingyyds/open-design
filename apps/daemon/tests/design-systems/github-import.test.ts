@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   importGitHubDesignSystemProject,
+  installHostedGitHubDesignSystemPackage,
   parseGitHubRepoUrl,
 } from '../../src/design-systems/github-import.js';
 
@@ -89,6 +90,39 @@ exit 1
   afterEach(() => {
     delete process.env.FAKE_GIT_SOURCE;
     fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  it('stages hosted packages, preserves authored files, and assigns ownership on publication', async () => {
+    const authored = '# Authored design fixture';
+    fs.writeFileSync(path.join(fixtureRoot, 'DESIGN.md'), authored);
+    fs.writeFileSync(path.join(fixtureRoot, 'components.html'), '<p>Authored fixture</p>');
+    fs.writeFileSync(path.join(fixtureRoot, 'metadata.json'), JSON.stringify({
+      projectId: 'source-project', platformUserId: 'source-user', title: 'Hosted fixture',
+    }));
+    fs.mkdirSync(userDesignSystemsRoot, { recursive: true });
+    const id = await installHostedGitHubDesignSystemPackage(
+      'https://github.com/acme/design-kit', tmpRoot, userDesignSystemsRoot,
+      { gitBin: fakeGit, platformUserId: 'fixture-tenant' },
+    );
+    const installed = path.join(userDesignSystemsRoot, id);
+    expect(fs.readFileSync(path.join(installed, 'DESIGN.md'), 'utf8')).toBe(authored);
+    expect(fs.readFileSync(path.join(installed, 'components.html'), 'utf8')).toBe('<p>Authored fixture</p>');
+    expect(JSON.parse(fs.readFileSync(path.join(installed, 'metadata.json'), 'utf8'))).toEqual({
+      platformUserId: 'fixture-tenant', title: 'Hosted fixture',
+    });
+    expect(fs.readdirSync(path.join(tmpRoot, 'github-design-system-imports'))).toEqual([]);
+  });
+
+  it('rejects links in hosted checkout fixtures before publishing a package', async () => {
+    fs.writeFileSync(path.join(fixtureRoot, 'DESIGN.md'), '# Hosted fixture');
+    fs.symlinkSync('DESIGN.md', path.join(fixtureRoot, 'reference.md'));
+    fs.mkdirSync(userDesignSystemsRoot, { recursive: true });
+    await expect(installHostedGitHubDesignSystemPackage(
+      'https://github.com/acme/design-kit', tmpRoot, userDesignSystemsRoot,
+      { gitBin: fakeGit, platformUserId: 'fixture-tenant' },
+    )).rejects.toThrow(/symbolic links/);
+    expect(fs.readdirSync(userDesignSystemsRoot)).toEqual([]);
+    expect(fs.readdirSync(path.join(tmpRoot, 'github-design-system-imports'))).toEqual([]);
   });
 
   it('clones a public GitHub URL and imports through the local project format', async () => {

@@ -35,7 +35,9 @@ import {
   suggestMemoryFromConnectors,
 } from '../memory-connectors.js';
 
-export interface RegisterMemoryRoutesDeps extends RouteDeps<'http' | 'paths' | 'appConfig'> {}
+export interface RegisterMemoryRoutesDeps extends RouteDeps<'http' | 'paths' | 'appConfig'> {
+  platform?: { enabled: boolean };
+}
 
 type UnknownRecord = Record<string, unknown>;
 type MemoryType =
@@ -106,6 +108,12 @@ function isExtractionProvider(value: unknown): value is MemoryExtractionProvider
 }
 
 export function registerMemoryRoutes(app: Express, ctx: RegisterMemoryRoutesDeps) {
+  if (ctx.platform?.enabled) {
+    app.use('/api/memory', (_req, res) =>
+      ctx.http.sendApiError(res, 403, 'FORBIDDEN', 'Shared memory is unavailable in hosted mode'),
+    );
+    return;
+  }
   const { RUNTIME_DATA_DIR, PROJECT_ROOT, PROJECTS_DIR } = ctx.paths;
   const { createSseResponse, requireLocalDaemonRequest } = ctx.http;
   const { readAppConfig } = ctx.appConfig;

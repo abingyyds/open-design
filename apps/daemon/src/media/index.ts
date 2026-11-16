@@ -61,11 +61,13 @@ import {
   type MediaSurface,
   VIDEO_LENGTHS_SEC,
   findMediaModel,
+  hostedMediaProviderBlockReason,
   findProvider,
   modelsForSurface,
 } from './models.js';
 import { assertAndFetchExternalAsset } from '../connectionTest.js';
 import { normalizeCodexConfigFile } from '../codex-config-normalize.js';
+import { hostedPlatformEnabled } from '../platform/deployment.js';
 import {
   resolveCodexImagegenEnv,
   resolveCodexSubscriptionStatus,
@@ -397,6 +399,11 @@ export async function generateMedia(args: {
       );
     }
   }
+  if (hostedPlatformEnabled()) {
+    const blocked = hostedMediaProviderBlockReason(def.provider);
+    if (blocked) throw new Error(blocked);
+  }
+
   // Reject cross-surface combinations for catalogued models.
   const resolvedAudioKind =
     surface === 'audio' ? audioKind || 'music' : undefined;
@@ -1062,6 +1069,9 @@ async function runCodexImagegen(
 }
 
 async function renderCodexImage(ctx: MediaContext): Promise<RenderResult> {
+  if (hostedPlatformEnabled()) {
+    throw new Error('Host Codex image generation is unavailable in hosted mode');
+  }
   const env = await resolveCodexImagegenEnv(ctx.projectRoot);
   await normalizeCodexConfigFile(env);
   const generatedRoot = codexGeneratedImagesRoot(env);

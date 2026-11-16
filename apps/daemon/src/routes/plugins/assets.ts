@@ -1,8 +1,10 @@
 import type { Express, Request, Response } from 'express';
 import type * as BetterSqlite3 from 'better-sqlite3';
 import path from 'node:path';
+import { setHostedDownloadHeaders, setHostedPreviewHeaders } from '../../http/hosted-file-response.js';
 
 export interface RegisterPluginAssetRoutesDeps {
+  platform?: { enabled: boolean };
   db: PluginDbLike;
   pluginAssetCache: { get(url: string): Promise<{ buf: Buffer; contentType: string }> };
   AssetCacheError: new (...args: unknown[]) => Error & { status: number };
@@ -110,6 +112,7 @@ export function registerPluginAssetRoutes(app: Express, deps: RegisterPluginAsse
       const ext = path.extname(contentPath).toLowerCase();
       const ct = ext === '.html' ? 'text/html; charset=utf-8' : ext === '.js' ? 'application/javascript; charset=utf-8' : ext === '.css' ? 'text/css; charset=utf-8' : ext === '.json' ? 'application/json; charset=utf-8' : ext === '.svg' ? 'image/svg+xml' : ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'application/octet-stream';
       res.setHeader('Content-Type', ct);
+      if (deps.platform?.enabled) setHostedPreviewHeaders(res);
       if (ext === '.html' && typeof contentRel === 'string') {
         buf = Buffer.from(rewritePluginAssetUrls(buf.toString('utf8'), routeParam(req.params.id), path.posix.dirname(contentRel.replace(/\\/g, '/'))), 'utf8');
       }
@@ -264,6 +267,7 @@ export function registerPluginAssetRoutes(app: Express, deps: RegisterPluginAsse
       const ext = path.extname(resolved).toLowerCase();
       const ct = ext === '.html' ? 'text/html; charset=utf-8' : ext === '.js' ? 'application/javascript; charset=utf-8' : ext === '.css' ? 'text/css; charset=utf-8' : ext === '.json' ? 'application/json; charset=utf-8' : ext === '.svg' ? 'image/svg+xml' : ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'application/octet-stream';
       res.setHeader('Content-Type', ct);
+      if (deps.platform?.enabled) setHostedDownloadHeaders(res, ct);
       res.send(buf);
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -278,6 +282,7 @@ export function registerPluginAssetRoutes(app: Express, deps: RegisterPluginAsse
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('Content-Security-Policy', "default-src 'none'");
       res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      if (deps.platform?.enabled) setHostedDownloadHeaders(res, contentType);
       return res.send(buf);
     } catch (err) {
       const status = err instanceof AssetCacheError ? err.status : 502;

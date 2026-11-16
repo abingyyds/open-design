@@ -1,10 +1,12 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { Request } from 'express';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { SubrouterPlatform } from '../../src/platform/subrouter.js';
+import { sendHostedResponses } from '../../src/platform/hosted-task-credentials.js';
 
 describe('SubrouterPlatform Codex runtime', () => {
   let platform: SubrouterPlatform | null = null;
@@ -38,63 +40,60 @@ describe('SubrouterPlatform Codex runtime', () => {
     return platform;
   }
 
-  it('writes an isolated Codex provider config for platform runs', () => {
+  it('resolves the selected model without creating a task home on the daemon', () => {
     const service = createPlatformUser();
-
-    const runtime = service.runtimeForUser('sr_platform_user');
-
-    expect(runtime.model).toBe('gpt-5.4');
-    expect(runtime.baseUrl).toBe('https://subrouter.example.com/v1');
-    expect(runtime.agentEnv).toMatchObject({
-      OPENAI_BASE_URL: 'https://subrouter.example.com/v1',
-      OPENAI_API_KEY: 'sk-platform-key',
-      CODEX_API_KEY: 'sk-platform-key',
-    });
-    expect(runtime.agentEnv.CODEX_HOME).toContain('codex-home');
-
-    const config = readFileSync(join(runtime.agentEnv.CODEX_HOME, 'config.toml'), 'utf8');
-    expect(config).toContain('model_provider = "open_design_platform"');
-    expect(config).toContain('model = "gpt-5.4"');
-    expect(config).toContain('[model_providers.open_design_platform]');
-    expect(config).toContain('base_url = "https://subrouter.example.com/v1"');
-    expect(config).toContain('env_key = "OPENAI_API_KEY"');
-    expect(config).toContain('wire_api = "responses"');
-    expect(config).toContain('requires_openai_auth = false');
-  });
-
-  it('refreshes the Codex provider config when the platform model changes', () => {
-    const service = createPlatformUser();
-    const firstRuntime = service.runtimeForUser('sr_platform_user');
-
+    expect(service.modelForUser('sr_platform_user')).toBe('gpt-5.4');
     service.setDefaultModel('sr_platform_user', 'gpt-5.5');
-    const secondRuntime = service.runtimeForUser('sr_platform_user');
-
-    expect(secondRuntime.agentEnv.CODEX_HOME).toBe(firstRuntime.agentEnv.CODEX_HOME);
-    const config = readFileSync(join(secondRuntime.agentEnv.CODEX_HOME, 'config.toml'), 'utf8');
-    expect(config).toContain('model = "gpt-5.5"');
-    expect(config).not.toContain('gpt-5.4');
+    expect(service.modelForUser('sr_platform_user')).toBe('gpt-5.5');
+    expect(existsSync(join(service.dataDir, 'users'))).toBe(false);
   });
 
-  it('keeps Railway account APIs private but sends Codex Responses traffic to the public gateway', () => {
+  it('requires a platform session before allocating a hosted task', async () => {
     const service = createPlatformUser();
-    service.db.prepare('UPDATE platform_users SET subrouter_base_url = ? WHERE id = ?')
-      .run('http://subrouter.railway.internal:8080', 'sr_platform_user');
-
-    const runtime = service.runtimeForUser('sr_platform_user');
-
-    expect(runtime.baseUrl).toBe('https://api.subrouter.com/v1');
-    expect(runtime.agentEnv.OPENAI_BASE_URL).toBe('https://api.subrouter.com/v1');
-    const config = readFileSync(join(runtime.agentEnv.CODEX_HOME, 'config.toml'), 'utf8');
-    expect(config).toContain('base_url = "https://api.subrouter.com/v1"');
+    const request = { headers: { cookie: 'od_platform_session=invalid' } } as Request;
+    await expect(service.runTaskForRequest(request, { image: '', prompt: 'test' })).rejects.toMatchObject({
+      code: 'PLATFORM_LOGIN_REQUIRED',
+    });
   });
 
-  it('allows deployments to override the dedicated SubRouter model gateway', () => {
-    const service = createPlatformUser();
-    service.env.OD_SUBROUTER_GATEWAY_BASE_URL = 'https://gateway.example.com/v1';
-    service.db.prepare('UPDATE platform_users SET subrouter_base_url = ? WHERE id = ?')
-      .run('http://subrouter.railway.internal:8080', 'sr_platform_user');
+  it.each([
+    ['https://gateway.example.test/v1', 'https://gateway.example.test/v1/responses'],
+    ['https://gateway.example.test/models/tenant/v1/', 'https://gateway.example.test/models/tenant/v1/responses'],
+  ])('appends Responses to the configured gateway URL %s', async (baseUrl, expectedUrl) => {
+    const mock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(null, { status: 204 }));
+    try {
+      await sendHostedResponses(baseUrl, 'sk-fixture-key', 'gpt-5.4', {}, new AbortController().signal);
+      expect(mock).toHaveBeenCalledWith(new URL(expectedUrl), expect.objectContaining({
+        method: 'POST', redirect: 'error',
+      }));
+    } finally {
+      mock.mockRestore();
+    }
+  });
 
-    expect(service.runtimeForUser('sr_platform_user').baseUrl).toBe('https://gateway.example.com/v1');
+  it('redacts a credential split across upstream response chunks', async () => {
+    const key = 'sk-synthetic-hosted-key';
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const part of ['prefix sk-synt', 'hetic-hosted', '-key suffix']) {
+          controller.enqueue(encoder.encode(part));
+        }
+        controller.close();
+      },
+    });
+    const mock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(stream));
+    try {
+      const result = await sendHostedResponses(
+        'https://gateway.example.com/v1', key, 'gpt-5.4', { model: 'untrusted' }, new AbortController().signal,
+      );
+      expect(mock).toHaveBeenCalledWith(new URL('https://gateway.example.com/v1/responses'), expect.objectContaining({
+        redirect: 'error', body: '{"model":"gpt-5.4","store":false,"background":false}',
+      }));
+      await expect(result.text()).resolves.toBe('prefix [redacted] suffix');
+    } finally {
+      mock.mockRestore();
+    }
   });
 
   it('accepts SubRouter JSON access tokens when login does not set a cookie', async () => {
@@ -336,7 +335,7 @@ describe('SubrouterPlatform Codex runtime', () => {
     service.db.prepare('UPDATE platform_users SET default_model = ? WHERE id = ?')
       .run('', 'sr_platform_user');
 
-    expect(() => service.runtimeForUser('sr_platform_user')).toThrowError(
+    expect(() => service.modelForUser('sr_platform_user')).toThrowError(
       expect.objectContaining({ code: 'NO_MODELS_AVAILABLE' }),
     );
   });
@@ -346,7 +345,7 @@ describe('SubrouterPlatform Codex runtime', () => {
     service.db.prepare('UPDATE platform_users SET default_model = ? WHERE id = ?')
       .run('claude-sonnet-4-20250514', 'sr_platform_user');
 
-    expect(() => service.runtimeForUser('sr_platform_user')).toThrowError(
+    expect(() => service.modelForUser('sr_platform_user')).toThrowError(
       expect.objectContaining({ code: 'MODEL_UNSUPPORTED_FOR_CODEX' }),
     );
   });

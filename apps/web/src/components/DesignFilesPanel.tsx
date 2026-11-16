@@ -1,4 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { HOSTED_PREVIEW_SANDBOX } from '@open-design/contracts';
+import { HostedPreviewFrame } from './HostedPreviewFrame';
+import { HostedPlatformContext } from '../providers/platform';
+import { projectPreviewFileUrl } from '../runtime/preview-file-url';
 import { useAnalytics } from '../analytics/provider';
 import { trackFileManagerClick } from '../analytics/events';
 import { useT } from '../i18n';
@@ -1352,9 +1356,11 @@ function HtmlPreviewThumbnail({
   projectId: string;
   file: ProjectFile;
 }) {
+  const hosted = useContext(HostedPlatformContext);
   const url = projectFileUrl(projectId, file.name);
   const [srcDoc, setSrcDoc] = useState<string | null>(null);
   useEffect(() => {
+    if (hosted) return;
     let cancelled = false;
     void fetch(`${url}?v=${Math.round(file.mtime)}`)
       .then((response) => (response.ok ? response.text() : null))
@@ -1368,7 +1374,11 @@ function HtmlPreviewThumbnail({
     return () => {
       cancelled = true;
     };
-  }, [file.mtime, file.name, projectId, url]);
+  }, [file.mtime, file.name, projectId, url, hosted]);
+
+  if (hosted) {
+    return <HostedPreviewFrame title={file.name} src={`${projectPreviewFileUrl(projectId, file.name)}?v=${Math.round(file.mtime)}`} sandbox={HOSTED_PREVIEW_SANDBOX} />;
+  }
 
   return (
     <iframe

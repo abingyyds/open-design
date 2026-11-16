@@ -1,11 +1,15 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { HOSTED_PREVIEW_NAVIGATION_PARAM } from '@open-design/contracts';
+import type { Brand } from '@open-design/contracts';
 
 import { DesignKitView } from '../../src/components/DesignKitView';
 import { I18nProvider } from '../../src/i18n';
-import type { DesignKit } from '../../src/runtime/design-kit';
+import { brandToKit, parsedToKit, type DesignKit } from '../../src/runtime/design-kit';
+import { parseDesignMd } from '../../src/runtime/design-md-parse';
+import { HostedPlatformContext } from '../../src/providers/platform';
 
 function previewKit(): DesignKit {
   return {
@@ -39,6 +43,48 @@ afterEach(() => {
 });
 
 describe('DesignKitView iframe sandboxing', () => {
+  const brand: Brand = {
+    name: 'Brand fixture',
+    sourceUrl: '',
+    tagline: '',
+    description: '',
+    colors: [],
+    logo: { primary: null, alternates: [], notes: '' },
+    typography: {
+      display: { family: 'Inter', fallbacks: [], weights: [] },
+      body: { family: 'Inter', fallbacks: [], weights: [] },
+    },
+    voice: { adjectives: [], tone: '', messagingPillars: [], vocabulary: { use: [], avoid: [] } },
+    imagery: { style: '', subjects: [], treatment: '', avoid: [], samples: [] },
+    layout: { radius: '', borderWeight: '', spacing: '', postureRules: [] },
+  };
+  it.each([
+    {
+      kind: 'project-backed',
+      kit: brandToKit(brand, { editable: true, projectId: 'brand-preview' }),
+      prefix: '/api/projects/brand-preview/preview-files',
+    },
+    {
+      kind: 'packaged',
+      kit: parsedToKit(parseDesignMd('# Packaged kit'), {
+        editable: false, designSystemId: 'user:kit-fixture',
+        packageInfo: { manifest: { id: 'kit-fixture', schemaVersion: 'fixture', name: 'Packaged kit', category: 'Fixture' } },
+      }),
+      prefix: '/api/design-systems/user%3Akit-fixture/preview-files',
+    },
+  ])('uses isolated file previews for the $kind kit and artifacts', ({ kit, prefix }) => {
+    const { container } = render(
+      <I18nProvider initial="en">
+        <DesignKitView kit={kit} />
+      </I18nProvider>,
+    );
+    expect(container.querySelector(`iframe[src="${prefix}/system/kit.html"]`)).toBeTruthy();
+    expect(container.querySelector(`iframe[src="${prefix}/system/artifacts/landing.html"]`)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Dark' }));
+    const dark = container.querySelector(`iframe[src="${prefix}/system/kit.dark.html"]`);
+    expect(dark?.getAttribute('sandbox')).toBe('allow-scripts allow-popups');
+  });
+
   it('does not let generated kit previews escape the iframe sandbox', () => {
     const { container } = render(
       <I18nProvider initial="en">
@@ -53,6 +99,57 @@ describe('DesignKitView iframe sandboxing', () => {
     }
     expect(container.innerHTML).not.toContain('allow-popups-to-escape-sandbox');
     expect(container.innerHTML).not.toContain('allow-same-origin');
+  });
+
+  it('applies the hosted policy to inline and file-based kit previews', () => {
+    const { container } = render(
+      <HostedPlatformContext.Provider value={true}>
+        <I18nProvider initial="en"><DesignKitView kit={previewKit()} /></I18nProvider>
+      </HostedPlatformContext.Provider>,
+    );
+    const frames = Array.from(container.querySelectorAll('iframe'));
+    expect(frames.some((frame) => frame.getAttribute('srcdoc')?.includes("connect-src 'none'"))).toBe(true);
+    for (const frame of frames) expect(frame.getAttribute('sandbox')).toBe('allow-scripts');
+  });
+
+  it('starts hosted kit and asset navigations only as their iframes enter view', () => {
+    const observed = new Map<Element, (entries: { isIntersecting: boolean }[]) => void>();
+    vi.stubGlobal('IntersectionObserver', class {
+      constructor(private readonly callback: (entries: { isIntersecting: boolean }[]) => void) {}
+      observe(target: Element) { observed.set(target, this.callback); }
+      disconnect() {}
+    });
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const kit = brandToKit(brand, { editable: true, projectId: 'brand-preview' });
+    try {
+      const { container } = render(
+        <HostedPlatformContext.Provider value={true}>
+          <I18nProvider initial="en"><DesignKitView kit={kit} /></I18nProvider>
+        </HostedPlatformContext.Provider>,
+      );
+      const kitFrame = container.querySelector('iframe[loading="lazy"]:not([aria-hidden])')!;
+      const assetFrame = container.querySelector('iframe[aria-hidden="true"]')!;
+      const frames = [kitFrame, assetFrame];
+      for (const frame of frames) expect(frame).not.toBeNull();
+      for (const frame of frames) expect(frame.getAttribute('src')).toBeNull();
+
+      act(() => observed.get(kitFrame)!([{ isIntersecting: false }]));
+      expect(kitFrame.getAttribute('src')).toBeNull();
+      frames.forEach((frame, index) => {
+        const visibleAt = now + (11 + index) * 60_000;
+        clock.mockReturnValue(visibleAt);
+        act(() => observed.get(frame)!([{ isIntersecting: true }]));
+        const url = new URL(frame.getAttribute('src')!, window.location.origin);
+        expect(url.pathname).toMatch(/^\/api\/projects\/brand-preview\/preview-files\//u);
+        expect(url.searchParams.get(HOSTED_PREVIEW_NAVIGATION_PARAM)?.split('.')[0]).toBe(String(visibleAt));
+        expect(frame.getAttribute('loading')).toBe('eager');
+        expect(frame.getAttribute('sandbox')).toBe('allow-scripts');
+      });
+    } finally {
+      clock.mockRestore();
+      vi.unstubAllGlobals();
+    }
   });
 
   it('renders new kit actions with the active non-English locale', () => {

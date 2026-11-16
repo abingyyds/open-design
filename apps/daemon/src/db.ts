@@ -13,6 +13,7 @@ import { migrateCritique } from './critique/persistence.js';
 import { migrateMediaTasks } from './media/tasks.js';
 import { migrateLibrary } from './library-store.js';
 import { migratePlugins } from './plugins/persistence.js';
+import { hostedPlatformEnabled } from './platform/deployment.js';
 
 type SqliteDb = Database.Database;
 type DbRow = Record<string, any>;
@@ -72,6 +73,12 @@ function migrate(db: SqliteDb): void {
       source_project_id TEXT,
       files_json TEXT NOT NULL,
       created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS hosted_template_origins (
+      template_id TEXT PRIMARY KEY REFERENCES templates(id) ON DELETE CASCADE,
+      owner_id TEXT NOT NULL,
+      project_created_at INTEGER NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS conversations (
@@ -368,6 +375,36 @@ function migrate(db: SqliteDb): void {
   if (tabsStateCols.length > 0 && !tabsStateCols.some((c: DbRow) => c.name === 'state_json')) {
     db.exec(`ALTER TABLE tabs_state ADD COLUMN state_json TEXT`);
   }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS retired_hosted_projects (
+      id TEXT PRIMARY KEY COLLATE NOCASE
+    );
+    CREATE TRIGGER IF NOT EXISTS retire_deleted_hosted_project
+    AFTER DELETE ON projects
+    WHEN CASE WHEN json_valid(OLD.metadata_json)
+      THEN json_type(OLD.metadata_json, '$.platformUserId') = 'text' ELSE 0 END
+    BEGIN
+      INSERT OR IGNORE INTO retired_hosted_projects (id) VALUES (OLD.id);
+    END;
+    CREATE TRIGGER IF NOT EXISTS forbid_retired_hosted_project_insert
+    BEFORE INSERT ON projects
+    WHEN EXISTS (SELECT 1 FROM retired_hosted_projects WHERE id = NEW.id)
+    BEGIN
+      SELECT RAISE(ABORT, 'Hosted project ID is retired');
+    END;
+  `);
+  if (hostedPlatformEnabled()) {
+    // Historical templates can outlive their source. Reserve absent project
+    // IDs before accepting requests so a new project cannot inherit them.
+    db.exec(`
+      INSERT OR IGNORE INTO retired_hosted_projects (id)
+      SELECT templates.source_project_id
+      FROM templates
+      WHERE templates.source_project_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM projects WHERE projects.id = templates.source_project_id);
+    `);
+  }
+
   migrateCritique(db);
   migrateMediaTasks(db);
   migrateLibrary(db);
@@ -593,15 +630,21 @@ const PROJECT_COLS = `id, name, skill_id AS skillId,
   created_at AS createdAt,
   updated_at AS updatedAt`;
 
-export function listProjects(db: SqliteDb) {
+export function listProjects(db: SqliteDb, platformUserId?: string) {
+  const owned = platformUserId !== undefined;
   const rows = db
     .prepare(
       `SELECT ${PROJECT_COLS}
          FROM projects
+        ${owned ? "WHERE CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.platformUserId') END = ?" : ''}
         ORDER BY updated_at DESC`,
     )
-    .all() as DbRow[];
+    .all(...(owned ? [platformUserId] : [])) as DbRow[];
   return rows.map(normalizeProject);
+}
+
+export function isHostedProjectIdRetired(db: SqliteDb, id: string): boolean {
+  return Boolean(db.prepare('SELECT 1 FROM retired_hosted_projects WHERE id = ?').get(id));
 }
 
 export function listLatestProjectRunStatuses(db: SqliteDb) {
@@ -795,34 +838,62 @@ export function getTemplate(db: SqliteDb, id: string) {
   return row ? normalizeTemplate(row) : null;
 }
 
+type HostedTemplateOrigin = { ownerId: string; projectCreatedAt: number };
+
+export function hostedTemplateBelongsToProject(
+  db: SqliteDb,
+  templateId: string,
+  project: { createdAt?: number; metadata?: { platformUserId?: unknown } } | null,
+): boolean {
+  const owner = project?.metadata?.platformUserId;
+  if (typeof owner !== 'string' || typeof project?.createdAt !== 'number') return false;
+  return Boolean(db.prepare(
+    `SELECT 1 FROM hosted_template_origins
+      WHERE template_id = ? AND owner_id = ? AND project_created_at = ?`,
+  ).get(templateId, owner, project.createdAt));
+}
+
 export function findTemplateByNameAndProject(
   db: SqliteDb,
   name: string,
   sourceProjectId: string,
+  origin?: HostedTemplateOrigin,
 ) {
   const row = db
     .prepare(
       `SELECT id, name, description, source_project_id AS sourceProjectId,
               files_json AS filesJson, created_at AS createdAt
          FROM templates
-        WHERE name = ? AND source_project_id = ?`,
+        WHERE name = ? AND source_project_id = ?
+          AND (? IS NULL OR EXISTS (
+            SELECT 1 FROM hosted_template_origins
+            WHERE template_id = templates.id AND owner_id = ? AND project_created_at = ?
+          ))
+        ORDER BY created_at DESC LIMIT 1`,
     )
-    .get(name, sourceProjectId) as DbRow | undefined;
+    .get(name, sourceProjectId, origin?.ownerId ?? null, origin?.ownerId ?? null, origin?.projectCreatedAt ?? null) as DbRow | undefined;
   return row ? normalizeTemplate(row) : null;
 }
 
-export function insertTemplate(db: SqliteDb, t: DbRow) {
-  db.prepare(
-    `INSERT INTO templates (id, name, description, source_project_id, files_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(
-    t.id,
-    t.name,
-    t.description ?? null,
-    t.sourceProjectId ?? null,
-    JSON.stringify(t.files ?? []),
-    t.createdAt,
-  );
+export function insertTemplate(db: SqliteDb, t: DbRow, origin?: HostedTemplateOrigin) {
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO templates (id, name, description, source_project_id, files_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      t.id,
+      t.name,
+      t.description ?? null,
+      t.sourceProjectId ?? null,
+      JSON.stringify(t.files ?? []),
+      t.createdAt,
+    );
+    if (origin) {
+      db.prepare(
+        'INSERT INTO hosted_template_origins (template_id, owner_id, project_created_at) VALUES (?, ?, ?)',
+      ).run(t.id, origin.ownerId, origin.projectCreatedAt);
+    }
+  })();
   return getTemplate(db, t.id);
 }
 
@@ -1277,10 +1348,18 @@ export function listMessages(db: SqliteDb, conversationId: string) {
     .map(normalizeMessage);
 }
 
+export class MessageConversationMismatchError extends Error {
+  constructor() {
+    super('message not found');
+    this.name = 'MessageConversationMismatchError';
+  }
+}
+
 export function upsertMessage(db: SqliteDb, conversationId: string, m: DbRow) {
   const existing = db
-    .prepare(`SELECT position FROM messages WHERE id = ?`)
+    .prepare(`SELECT conversation_id AS conversationId FROM messages WHERE id = ?`)
     .get(m.id) as DbRow | undefined;
+  if (existing && existing.conversationId !== conversationId) throw new MessageConversationMismatchError();
   const now = Date.now();
   if (existing) {
     db.prepare(
@@ -1296,7 +1375,7 @@ export function upsertMessage(db: SqliteDb, conversationId: string, m: DbRow) {
                 ELSE telemetry_finalized_at
               END,
               started_at = ?, ended_at = ?
-        WHERE id = ?`,
+        WHERE id = ? AND conversation_id = ?`,
     ).run(
       m.role,
       m.content,
@@ -1319,6 +1398,7 @@ export function upsertMessage(db: SqliteDb, conversationId: string, m: DbRow) {
       m.startedAt ?? null,
       m.endedAt ?? null,
       m.id,
+      conversationId,
     );
   } else {
     const max = db
@@ -1392,9 +1472,9 @@ export function upsertMessage(db: SqliteDb, conversationId: string, m: DbRow) {
               applied_plugin_snapshot_json AS appliedPluginSnapshotJson,
               created_at AS createdAt, started_at AS startedAt, ended_at AS endedAt,
               position
-         FROM messages WHERE id = ?`,
+         FROM messages WHERE id = ? AND conversation_id = ?`,
     )
-    .get(m.id) as DbRow | undefined;
+    .get(m.id, conversationId) as DbRow | undefined;
   return row ? normalizeMessage(row) : null;
 }
 

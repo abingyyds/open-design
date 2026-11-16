@@ -44,6 +44,7 @@ const PLATFORM_LABEL_KEY: Record<
 
 interface Props {
   share: SocialShareResponse;
+  resolveShare?: () => SocialShareResponse | null;
   className?: string;
   // Fired at click time for both the intent and copy flavours so callers can
   // attach analytics without each one re-implementing the branch logic.
@@ -51,7 +52,7 @@ interface Props {
   onAfterShare?: () => void;
 }
 
-export function SocialShareGrid({ share, className, onShare, onAfterShare }: Props) {
+export function SocialShareGrid({ share, resolveShare, className, onShare, onAfterShare }: Props) {
   const t = useT();
   const [feedbackPlatform, setFeedbackPlatform] = useState<SocialSharePlatform | null>(null);
   const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -66,9 +67,10 @@ export function SocialShareGrid({ share, className, onShare, onAfterShare }: Pro
   const copyAndOpen = async (
     platform: SocialSharePlatform,
     entryUrl: string | undefined,
+    copyText: string,
   ) => {
     const pendingWindow = entryUrl ? window.open('about:blank', '_blank') : null;
-    const ok = await copyToClipboard(share.copyText);
+    const ok = await copyToClipboard(copyText);
     if (!ok) {
       pendingWindow?.close();
       return;
@@ -103,7 +105,15 @@ export function SocialShareGrid({ share, className, onShare, onAfterShare }: Pro
               href={target.shareUrl}
               target="_blank"
               rel="noreferrer noopener"
-              onClick={() => {
+              onClick={(event) => {
+                if (resolveShare) {
+                  const current = resolveShare()?.platforms.find((item) => item.platform === target.platform);
+                  if (!current?.shareUrl || current.shareUrl !== target.shareUrl) {
+                    event.preventDefault();
+                    if (!current?.shareUrl) return;
+                    window.open(current.shareUrl, '_blank', 'noopener,noreferrer');
+                  }
+                }
                 onShare?.(target.platform);
                 onAfterShare?.();
               }}
@@ -119,8 +129,11 @@ export function SocialShareGrid({ share, className, onShare, onAfterShare }: Pro
             type="button"
             className={`social-share-button social-share-button--${target.platform}`}
             onClick={() => {
+              const currentShare = resolveShare ? resolveShare() : share;
+              const currentTarget = currentShare?.platforms.find((item) => item.platform === target.platform);
+              if (!currentShare || !currentTarget) return;
               onShare?.(target.platform);
-              void copyAndOpen(target.platform, target.entryUrl);
+              void copyAndOpen(target.platform, currentTarget.entryUrl, currentShare.copyText);
             }}
           >
             <span className="social-share-button__icon" aria-hidden>{icon}</span>

@@ -43,6 +43,7 @@ import { agentCliEnvForAgent, appConfigDir, readAppConfig } from '../app-config.
 import { expandHomePrefix } from '../home-expansion.js';
 import { spawnEnvForAgent } from '../runtimes/env.js';
 import { resolveXAIBearer } from '../integrations/xai-credentials.js';
+import { hostedPlatformEnabled } from '../platform/deployment.js';
 import { isSandboxModeEnabled } from '../sandbox-mode.js';
 
 const PROVIDER_IDS = MEDIA_PROVIDERS.map((p) => p.id);
@@ -242,6 +243,7 @@ export async function resolveModelAlias(
 ): Promise<string> {
   const envAliases = readEnvAliases();
   if (envAliases[modelId]) return envAliases[modelId]!;
+  if (hostedPlatformEnabled()) return modelId;
   const stored = await readStoredAliases(projectRoot);
   return stored[modelId] ?? modelId;
 }
@@ -317,7 +319,7 @@ function codexHomeFromEnv(env: NodeJS.ProcessEnv): string {
 export async function resolveCodexSubscriptionStatus(
   projectRoot?: string,
 ): Promise<CodexSubscriptionStatus> {
-  if (isSandboxModeEnabled(process.env)) return { available: false };
+  if (hostedPlatformEnabled() || isSandboxModeEnabled(process.env)) return { available: false };
   const env = await resolveCodexImagegenEnv(projectRoot);
   const codexAuth = await readJsonIfPresent(
     path.join(codexHomeFromEnv(env), 'auth.json'),
@@ -392,9 +394,12 @@ async function resolveXAIOAuthCredential(
  * Returns { apiKey, baseUrl } where either may be empty string.
  */
 export async function resolveProviderConfig(projectRoot: string, providerId: string): Promise<ProviderEntry> {
+  const envKey = readEnvKey(providerId);
+  // The hosted daemon never combines an operator's key with a shared
+  // desktop config destination or a local user authentication file.
+  if (hostedPlatformEnabled()) return { apiKey: envKey || '', baseUrl: '' };
   const stored = await readStored(projectRoot);
   const entry = stored[providerId] || {};
-  const envKey = readEnvKey(providerId);
   const needsExternalCredential = !envKey && !entry.apiKey;
   const externalCredential = needsExternalCredential
     ? providerId === 'openai'
@@ -554,7 +559,7 @@ export async function seedProviderIfMissing(
   providerId: string,
   entry: { apiKey?: string; baseUrl?: string; model?: string },
 ): Promise<boolean> {
-  if (!PROVIDER_IDS.includes(providerId)) return false;
+  if (hostedPlatformEnabled() || !PROVIDER_IDS.includes(providerId)) return false;
   const apiKey = entry.apiKey?.trim() ?? '';
   if (!apiKey) return false;
   // Env var wins at resolution time, so seeding when env is set would

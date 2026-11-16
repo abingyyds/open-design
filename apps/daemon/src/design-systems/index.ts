@@ -10,9 +10,12 @@
 // `surface`) fall back to frontmatter when the body has none.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { reserveDesignSystemDirectory } from './directory.js';
 import JSZip from 'jszip';
+import { hostedPlatformEnabled } from '../platform/deployment.js';
+import { isRegularDesignSystemTree } from './package-files.js';
 
 import {
   type ComponentsManifest,
@@ -281,9 +284,11 @@ export async function listDesignSystems(
   } catch {
     return out;
   }
+  const hostedUserCatalog = options.source === 'user' && hostedPlatformEnabled();
   for (const entry of entries) {
     if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
     const brandRoot = path.join(root, entry.name);
+    if (hostedUserCatalog && !(await isRegularDesignSystemTree(brandRoot))) continue;
     const manifest = await readProjectManifest(brandRoot, entry.name);
     const designPath = path.join(brandRoot, manifest?.files.design ?? 'DESIGN.md');
     try {
@@ -530,32 +535,46 @@ export async function readDesignSystemStaticFile(
   relativePath: string,
   options: { idPrefix?: string } = {},
 ): Promise<DesignSystemStaticFileDetail | null> {
+  const file = await resolveDesignSystemStaticFile(root, id, relativePath, options);
+  if (!file) return null;
+  const { filePath, ...detail } = file;
+  try {
+    return { ...detail, bytes: await readFile(filePath) };
+  } catch (err) {
+    if (isAbsenceError(err)) return null;
+    throw err;
+  }
+}
+
+export async function resolveDesignSystemStaticFile(
+  root: string,
+  id: string,
+  relativePath: string,
+  options: { idPrefix?: string; ownerId?: string } = {},
+): Promise<(Omit<DesignSystemStaticFileDetail, 'bytes'> & { filePath: string }) | null> {
   const dirId = stripPrefixAndValidateId(id, options.idPrefix);
   const cleanPath = sanitizeRelativeFilePath(relativePath);
   if (!dirId || !cleanPath) return null;
 
-  const brandRoot = path.join(root, dirId);
-  const manifest = await readProjectManifest(brandRoot, dirId);
-  if (!(await isAllowedDesignSystemStaticFile(brandRoot, manifest, cleanPath))) return null;
-
-  const resolvedRoot = path.resolve(brandRoot);
-  const filePath = path.resolve(brandRoot, cleanPath);
-  if (filePath !== resolvedRoot && !filePath.startsWith(`${resolvedRoot}${path.sep}`)) {
-    return null;
-  }
-
   try {
+    const base = await realpath(root);
+    const brandRoot = path.join(base, dirId);
+    if (await realpath(brandRoot) !== brandRoot) return null;
+    if (options.ownerId !== undefined && (await readUserMetadata(base, dirId)).platformUserId !== options.ownerId) return null;
+    const filePath = path.resolve(brandRoot, cleanPath);
+    if (!filePath.startsWith(`${brandRoot}${path.sep}`) || await realpath(filePath) !== filePath) return null;
+    const manifest = await readProjectManifest(brandRoot, dirId);
+    if (!isAllowedDesignSystemStaticFile(manifest, cleanPath)) return null;
     const stats = await stat(filePath);
     if (!stats.isFile()) return null;
-    const bytes = await readFile(filePath);
     return {
+      filePath,
       path: cleanPath,
       name: path.basename(cleanPath),
       kind: classifyDesignSystemFile(cleanPath, false),
       size: stats.size,
       updatedAt: stats.mtime.toISOString(),
       contentType: designSystemStaticContentType(cleanPath),
-      bytes,
     };
   } catch (err) {
     if (isAbsenceError(err)) return null;
@@ -889,11 +908,10 @@ const DESIGN_SYSTEM_STATIC_SYSTEM_FILES = new Set([
   'system/artifacts/form.html',
 ]);
 
-async function isAllowedDesignSystemStaticFile(
-  brandRoot: string,
+function isAllowedDesignSystemStaticFile(
   manifest: DesignSystemProjectManifest | null,
   relativePath: string,
-): Promise<boolean> {
+): boolean {
   if (!isSafeManifestPath(relativePath)) return false;
   if (DESIGN_SYSTEM_STATIC_SYSTEM_FILES.has(relativePath)) return true;
 
@@ -913,9 +931,7 @@ async function isAllowedDesignSystemStaticFile(
   for (const page of manifest?.preview?.pages ?? []) add(page.path);
   for (const font of manifest?.fonts ?? []) add(font.file);
 
-  if (manifest?.assetsDir === 'assets') {
-    await addFilesUnderDeclaredDir(brandRoot, 'assets', allowed);
-  }
+  if (manifest?.assetsDir === 'assets' && relativePath.startsWith('assets/')) return true;
 
   return allowed.has(relativePath);
 }
@@ -923,6 +939,9 @@ async function isAllowedDesignSystemStaticFile(
 function designSystemStaticContentType(relativePath: string): string {
   const ext = path.extname(relativePath).toLowerCase();
   switch (ext) {
+    case '.js':
+    case '.mjs':
+      return 'text/javascript; charset=utf-8';
     case '.html':
       return 'text/html; charset=utf-8';
     case '.css':
@@ -1124,7 +1143,6 @@ export async function createUserDesignSystem(
   input: UserDesignSystemInput,
 ): Promise<DesignSystemSummary> {
   const title = normalizeTitle(input.title);
-  const dirId = await uniqueSlug(root, slugify(title));
   const now = new Date().toISOString();
   const provenance = normalizeProvenance(input.provenance, {
     ...(input.summary ? { companyBlurb: input.summary } : {}),
@@ -1137,20 +1155,9 @@ export async function createUserDesignSystem(
     sourceNotes,
   });
   const surface = input.surface ?? extractSurface(body) ?? 'web';
-  await mkdir(path.join(root, dirId), { recursive: true });
+  const dirId = await reserveDesignSystemDirectory(root, slugify(title));
   await writeFile(path.join(root, dirId, 'DESIGN.md'), body, 'utf8');
   const artifactMode = normalizeArtifactMode(input.artifactMode);
-  await writeUserMetadata(root, dirId, {
-    title,
-    category: cleanText(input.category) || extractCategory(body) || 'Custom',
-    surface,
-    status: input.status ?? 'draft',
-    ...(artifactMode ? { artifactMode } : {}),
-    createdAt: now,
-    updatedAt: now,
-    ...(provenance ? { provenance } : {}),
-    ...(input.platformUserId ? { platformUserId: input.platformUserId } : {}),
-  });
   if (artifactMode !== 'agent-managed') {
     await writeGeneratedDesignSystemFiles(root, dirId, {
       title,
@@ -1162,6 +1169,17 @@ export async function createUserDesignSystem(
       body,
     });
   }
+  await writeUserMetadata(root, dirId, {
+    title,
+    category: cleanText(input.category) || extractCategory(body) || 'Custom',
+    surface,
+    status: input.status ?? 'draft',
+    ...(artifactMode ? { artifactMode } : {}),
+    createdAt: now,
+    updatedAt: now,
+    ...(provenance ? { provenance } : {}),
+    ...(input.platformUserId ? { platformUserId: input.platformUserId } : {}),
+  });
   const listed = await listDesignSystems(root, {
     idPrefix: 'user:',
     source: 'user',
@@ -2668,19 +2686,6 @@ function sanitizeRevisionId(raw: string | undefined): string | null {
   if (typeof raw !== 'string') return null;
   const value = raw.trim();
   return /^[a-zA-Z0-9-]+$/.test(value) ? value : null;
-}
-
-async function uniqueSlug(root: string, base: string): Promise<string> {
-  let candidate = base || 'design-system';
-  let index = 2;
-  for (;;) {
-    try {
-      await stat(path.join(root, candidate));
-      candidate = `${base}-${index++}`;
-    } catch {
-      return candidate;
-    }
-  }
 }
 
 function slugify(raw: string): string {

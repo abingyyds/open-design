@@ -1,3 +1,4 @@
+import { hostedProjectDirectory } from './platform/hosted-task-project.js';
 // OD Library reconcile — mirror design systems and agent-produced project
 // deliverables into the Library as *referenced* assets, so the Library is the
 // single place a user sees everything they've made (clips, uploads, design
@@ -254,25 +255,34 @@ function buildProducedMap(db: SqliteDb, projectId: string): Map<string, string> 
   return produced;
 }
 
+export interface LibraryProjectScope {
+  userId: string;
+  ownsManagedProject(project: { id: string; metadata?: unknown }): boolean;
+}
+
 /** Index each project's deliverable files as referenced Library assets. */
 async function reconcileProjects(
   db: SqliteDb,
   paths: ReconcileLibraryPaths,
   result: ReconcileLibraryResult,
+  tenant?: LibraryProjectScope,
 ): Promise<void> {
   let projects: Array<{ id: string; metadata?: unknown }>;
   try {
-    projects = listProjects(db) as Array<{ id: string; metadata?: unknown }>;
+    projects = listProjects(db, tenant?.userId);
   } catch {
     return;
   }
   for (const project of projects) {
+    if (tenant && !tenant.ownsManagedProject(project)) continue;
     let projectDir: string;
     let files: ProjectFileLike[];
     try {
       // Same resolution listFiles uses; both throw for unavailable sandbox
       // imported projects, which we simply skip.
-      projectDir = resolveProjectDir(paths.PROJECTS_DIR, project.id, project.metadata);
+      projectDir = tenant
+        ? await hostedProjectDirectory(paths.PROJECTS_DIR, project.id)
+        : resolveProjectDir(paths.PROJECTS_DIR, project.id, project.metadata);
       files = (await listFiles(paths.PROJECTS_DIR, project.id, {
         metadata: project.metadata,
       })) as ProjectFileLike[];
@@ -286,7 +296,7 @@ async function reconcileProjects(
         const rel = file.path ?? file.name;
         if (!rel) continue;
         // Cheap "already synced?" guard — no bytes read.
-        if (findReferencedAssetByOrigin(db, project.id, rel)) {
+        if (findReferencedAssetByOrigin(db, project.id, rel, tenant?.userId)) {
           result.deduped += 1;
           continue;
         }
@@ -299,6 +309,7 @@ async function reconcileProjects(
           db,
           libraryDir: paths.LIBRARY_DIR,
           storage: 'referenced',
+          platformUserId: tenant?.userId,
           absPath,
           kind: libraryKindFor(file.kind),
           mime: file.mime,
@@ -326,6 +337,7 @@ async function reconcileProjects(
 export async function reconcileLibrary(
   db: SqliteDb,
   paths: ReconcileLibraryPaths,
+  tenant?: LibraryProjectScope,
 ): Promise<ReconcileLibraryResult> {
   const result: ReconcileLibraryResult = {
     designSystems: 0,
@@ -334,12 +346,12 @@ export async function reconcileLibrary(
     total: 0,
   };
   try {
-    await reconcileDesignSystems(db, paths, result);
+    if (!tenant) await reconcileDesignSystems(db, paths, result);
   } catch {
     // best-effort
   }
   try {
-    await reconcileProjects(db, paths, result);
+    await reconcileProjects(db, paths, result, tenant);
   } catch {
     // best-effort
   }

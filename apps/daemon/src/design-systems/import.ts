@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { extractComponentsManifest } from '@open-design/contracts/design-systems/components-manifest';
@@ -11,6 +11,7 @@ import {
   type DesignTokenContractReport,
 } from './token-contract.js';
 import { extractCssCustomProperties } from './token-evidence.js';
+import { reserveDesignSystemDirectory } from './directory.js';
 
 export type LocalDesignSystemImportResult = {
   id: string;
@@ -131,75 +132,81 @@ export async function importLocalDesignSystemProject(
 
   const scan = await scanProject(sourceRoot);
   const displayName = cleanDisplayName(options.name ?? scan.packageName ?? options.fallbackName ?? path.basename(sourceRoot));
-  const id = await nextAvailableSlug(userDesignSystemsRoot, slugify(displayName), options.reservedIds);
+  const id = await reserveDesignSystemDirectory(
+    userDesignSystemsRoot, slugify(displayName) || 'imported-design-system', options.reservedIds,
+  );
   const outDir = path.join(userDesignSystemsRoot, id);
-  await mkdir(outDir, { recursive: true });
-  const importMode = normalizeImportMode(options.importMode);
-  const craftApplies = normalizeCraftList(options.craftApplies);
-  const now = options.now ?? new Date();
+  try {
+    const importMode = normalizeImportMode(options.importMode);
+    const craftApplies = normalizeCraftList(options.craftApplies);
+    const now = options.now ?? new Date();
 
-  const files = [
-    'USAGE.md',
-    'DESIGN.md',
-    'tokens.css',
-    'design-tokens.json',
-    'tailwind-v4.css',
-    'components.html',
-    'components.manifest.json',
-    'manifest.json',
-  ];
-  const designMd = renderDesignMd(id, displayName, scan);
-  const tokenContract = buildDesignTokenContract({ sourceTokens: scan.cssVariables, generatedAt: now });
-  const tokensCss = tokenContract.tokensCss;
-  const componentsHtml = renderComponentsHtml(displayName, tokensCss);
-  const tokenContractReport = buildReportWithSelfCheck(
-    tokenContract.report,
-    validateDesignTokenOutputs({ tokensCss, fixtureHtml: componentsHtml }),
-  );
-  const componentsManifest = extractComponentsManifest({
-    brandId: id,
-    fixtureHtml: componentsHtml,
-    tokensCss,
-  });
+    const files = [
+      'USAGE.md',
+      'DESIGN.md',
+      'tokens.css',
+      'design-tokens.json',
+      'tailwind-v4.css',
+      'components.html',
+      'components.manifest.json',
+      'manifest.json',
+    ];
+    const designMd = renderDesignMd(id, displayName, scan);
+    const tokenContract = buildDesignTokenContract({ sourceTokens: scan.cssVariables, generatedAt: now });
+    const tokensCss = tokenContract.tokensCss;
+    const componentsHtml = renderComponentsHtml(displayName, tokensCss);
+    const tokenContractReport = buildReportWithSelfCheck(
+      tokenContract.report,
+      validateDesignTokenOutputs({ tokensCss, fixtureHtml: componentsHtml }),
+    );
+    const componentsManifest = extractComponentsManifest({
+      brandId: id,
+      fixtureHtml: componentsHtml,
+      tokensCss,
+    });
 
-  await writeFile(path.join(outDir, 'USAGE.md'), renderUsageMd(displayName, scan), 'utf8');
-  await writeFile(path.join(outDir, 'DESIGN.md'), designMd, 'utf8');
-  await writeFile(path.join(outDir, 'tokens.css'), tokensCss, 'utf8');
-  await writeFile(path.join(outDir, 'design-tokens.json'), renderDesignTokensJson({
-    bindings: tokenContract.bindings,
-    report: tokenContractReport,
-  }), 'utf8');
-  await writeFile(path.join(outDir, 'tailwind-v4.css'), renderTailwindV4Css(tokenContract.bindings), 'utf8');
-  await writeFile(path.join(outDir, 'components.html'), componentsHtml, 'utf8');
-  await writeFile(
-    path.join(outDir, 'components.manifest.json'),
-    `${JSON.stringify(componentsManifest, null, 2)}\n`,
-    'utf8',
-  );
-  files.push(...(await writePreviewFiles(outDir, displayName, scan, tokenContract.bindings)));
-  files.push(...(await writeSourceEvidenceFiles(outDir, scan, tokenContractReport)));
-  await writeFile(
-    path.join(outDir, 'manifest.json'),
-    `${JSON.stringify(
-      renderManifest(id, displayName, scan, now, options.source, importMode, craftApplies),
-      null,
-      2,
-    )}\n`,
-    'utf8',
-  );
-  if (options.platformUserId) {
+    await writeFile(path.join(outDir, 'USAGE.md'), renderUsageMd(displayName, scan), 'utf8');
+    await writeFile(path.join(outDir, 'DESIGN.md'), designMd, 'utf8');
+    await writeFile(path.join(outDir, 'tokens.css'), tokensCss, 'utf8');
+    await writeFile(path.join(outDir, 'design-tokens.json'), renderDesignTokensJson({
+      bindings: tokenContract.bindings,
+      report: tokenContractReport,
+    }), 'utf8');
+    await writeFile(path.join(outDir, 'tailwind-v4.css'), renderTailwindV4Css(tokenContract.bindings), 'utf8');
+    await writeFile(path.join(outDir, 'components.html'), componentsHtml, 'utf8');
     await writeFile(
-      path.join(outDir, 'metadata.json'),
-      `${JSON.stringify({ platformUserId: options.platformUserId }, null, 2)}\n`,
+      path.join(outDir, 'components.manifest.json'),
+      `${JSON.stringify(componentsManifest, null, 2)}\n`,
       'utf8',
     );
-  }
+    files.push(...(await writePreviewFiles(outDir, displayName, scan, tokenContract.bindings)));
+    files.push(...(await writeSourceEvidenceFiles(outDir, scan, tokenContractReport)));
+    await writeFile(
+      path.join(outDir, 'manifest.json'),
+      `${JSON.stringify(
+        renderManifest(id, displayName, scan, now, options.source, importMode, craftApplies),
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
+    const copiedAssets = await copyAssets(scan.assets, outDir);
+    const copiedFonts = await copyFonts(scan.fonts, outDir);
+    files.push(...copiedAssets);
+    files.push(...copiedFonts);
+    if (options.platformUserId) {
+      await writeFile(
+        path.join(outDir, 'metadata.json'),
+        `${JSON.stringify({ platformUserId: options.platformUserId }, null, 2)}\n`,
+        'utf8',
+      );
+    }
 
-  const copiedAssets = await copyAssets(scan.assets, outDir);
-  const copiedFonts = await copyFonts(scan.fonts, outDir);
-  files.push(...copiedAssets);
-  files.push(...copiedFonts);
-  return { id, dir: outDir, files };
+    return { id, dir: outDir, files };
+  } catch (error) {
+    await rm(outDir, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 export class LocalDesignSystemImportError extends Error {
@@ -406,26 +413,6 @@ async function copyFonts(fonts: FileCandidate[], outDir: string): Promise<string
     copied.push(`fonts/${targetName}`);
   }
   return copied;
-}
-
-async function nextAvailableSlug(
-  root: string,
-  preferred: string,
-  reservedIds: Iterable<string> = [],
-): Promise<string> {
-  await mkdir(root, { recursive: true });
-  const base = preferred || 'imported-design-system';
-  const reserved = new Set(reservedIds);
-  for (let index = 1; index < 1000; index += 1) {
-    const id = index === 1 ? base : `${base}-${index}`;
-    if (reserved.has(id)) continue;
-    try {
-      await stat(path.join(root, id));
-    } catch {
-      return id;
-    }
-  }
-  throw new LocalDesignSystemImportError('INTERNAL_ERROR', 'could not allocate design system id');
 }
 
 function renderManifest(

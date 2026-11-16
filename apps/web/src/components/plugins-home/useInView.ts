@@ -11,6 +11,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 export interface UseInViewOptions {
+  enabled?: boolean;
   rootMargin?: string;
   /** Stop observing after the first time the node becomes visible. */
   once?: boolean;
@@ -24,7 +25,7 @@ export function useInView<T extends Element = HTMLElement>(
 
   useEffect(() => {
     const node = ref.current;
-    if (!node) return;
+    if (!node || options.enabled === false) return;
 
     if (typeof IntersectionObserver === 'undefined') {
       setInView(true);
@@ -48,7 +49,7 @@ export function useInView<T extends Element = HTMLElement>(
     );
     observer.observe(node);
     return () => observer.disconnect();
-  }, [options.once, options.rootMargin]);
+  }, [options.enabled, options.once, options.rootMargin]);
 
   return { ref, inView };
 }

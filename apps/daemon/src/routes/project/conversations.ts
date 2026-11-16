@@ -1,6 +1,7 @@
 import type { Express } from 'express';
 import { type ChatSessionMode } from '@open-design/contracts';
 import { readAnalyticsContext } from '../../analytics.js';
+import { MessageConversationMismatchError } from '../../db.js';
 import { backfillBrandExtractionTranscriptForProject } from '../../brands/index.js';
 import type { RouteDeps } from '../../server-context.js';
 import { registerProjectCommentRoutes } from './comments.js';
@@ -182,10 +183,18 @@ export function registerProjectConversationRoutes(app: Express, ctx: RegisterPro
     if (m.id && m.id !== req.params.mid) {
       return res.status(400).json({ error: 'id mismatch' });
     }
-    const saved = upsertMessage(db, req.params.cid, {
-      ...m,
-      id: req.params.mid,
-    });
+    let saved;
+    try {
+      saved = upsertMessage(db, req.params.cid, {
+        ...m,
+        id: req.params.mid,
+      });
+    } catch (err) {
+      if (err instanceof MessageConversationMismatchError) {
+        return res.status(404).json({ error: 'message not found' });
+      }
+      throw err;
+    }
     // Bump the parent project's updatedAt so the project list re-orders.
     updateProject(db, req.params.id, {});
     ctx.telemetry?.reportFinalizedMessage(saved, m, {
